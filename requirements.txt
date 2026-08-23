@@ -1,0 +1,84 @@
+# ─── Core (required for all modes) ───────────────────────────────────────────
+numpy<2                # Pinned, not just a lower bound. numpy 2.x breaks in
+                       # TWO separate ways for this project: (1) a hard,
+                       # import-time crash if scipy/other compiled
+                       # dependencies in your environment were built against
+                       # numpy 1.x's C ABI -- "A module that was compiled
+                       # using NumPy 1.x cannot be run in NumPy 2.x" --
+                       # confirmed directly, a real user's anaconda
+                       # environment crashed exactly this way on the very
+                       # first `import scipy.stats` line, before any of
+                       # JasMAP4's own code even runs; (2) more subtly,
+                       # numpy 2.x changed scalar-conversion behavior for
+                       # size-1 arrays (some code that worked under 1.x now
+                       # raises "only 0-dimensional arrays can be converted
+                       # to Python scalars") -- confirmed directly against
+                       # this project's own validator suite. If you hit the
+                       # import-time crash above and can't easily pin numpy
+                       # here (e.g. a shared/managed anaconda environment),
+                       # the fix is the same either way: `pip install
+                       # "numpy<2"` (or `conda install "numpy<2"`) in the
+                       # environment you actually run JasMAP4.py from.
+pandas>=0.17.0
+scipy>=1.0
+polars>=0.20           # fast tped reading and kinship computation.
+                       # If you see "RuntimeWarning: Missing required CPU
+                       # features" (avx2/fma/bmi1/bmi2/lzcnt/movbe) on an
+                       # older CPU or a restricted VM, the default build can
+                       # crash. Fix: pip install "polars[rtcompat]" -- this
+                       # adds a compatible runtime that Polars selects
+                       # automatically at import time based on your CPU;
+                       # no need to uninstall the default polars first.
+scikit-learn>=1.0      # PRS, GIFT PCA/NMF, consensus LAI
+matplotlib>=3.5        # all publication-quality plots
+
+# ─── Genotype input (install only what your format needs) ────────────────────
+bed-reader>=1.0        # --bfile (PLINK .bed/.bim/.fam). Prebuilt wheels for
+                       # Windows/macOS/Linux, Python 3.10-3.14, no C compiler.
+                       # Replaces pandas-plink (which requires the MSVC Build
+                       # Tools on Windows due to its cffi/C extension).
+# --vcf input needs NO extra package: JasMAP4 uses its own pure-Python VCF
+# parser (jasmap.parse.read_vcf_lightweight), supporting plain-text and
+# gzip-compressed (.vcf.gz) files. scikit-allel was removed for the same
+# reason pandas-plink was: its compiled allel.opt.model extension has patchy
+# Windows wheel coverage and falls back to a source build requiring the MSVC
+# Build Tools. The pure-Python parser is slower on very large VCFs than
+# scikit-allel's C-optimized reader -- for biobank-scale cohorts (500K+
+# samples, millions of variants), convert to PLINK format and use --bfile
+# with bed-reader instead, which remains the fastest and most scalable path.
+
+# ─── Optional: --annot auto gene-annotation ──────────────────────────────────
+certifi                # ONLY needed for --annot (auto-downloading a reference
+                       # gene annotation). Not required by any other mode, and
+                       # not required for --annot either once a build's
+                       # annotation is already cached locally -- the download
+                       # happens at most once per --genome-build.
+                       #
+                       # Why it's listed at all: --annot downloads over HTTPS,
+                       # and some Python installs (notably anaconda on
+                       # Linux/macOS, but confirmed on Windows too) can't
+                       # locate a CA certificate bundle, failing with
+                       # "CERTIFICATE_VERIFY_FAILED: unable to get local
+                       # issuer certificate" even though the server is
+                       # perfectly reachable. JasMAP4 handles this by retrying
+                       # with certifi's bundled CA roots (the same trust store
+                       # pip and requests use) -- verification stays fully
+                       # enabled, this is NOT an SSL bypass -- but that retry
+                       # only works if certifi is actually installed.
+                       #
+                       # If you can't install it (locked-down environment),
+                       # --annot degrades gracefully rather than failing the
+                       # run: it falls back to 50-SNP sliding-window gene
+                       # proxies and continues. To get real gene annotation
+                       # without any network access, download the reference
+                       # manually from
+                       # https://hgdownload.soe.ucsc.edu/goldenPath/<build>/bigZips/genes/<build>.refGene.gtf.gz
+                       # into ~/.jasmap_annotation_cache/ (the cache is
+                       # checked before any download is attempted), or pass
+                       # your own file via --gene-annot instead.
+
+# ─── NOT required by JasMAP2.py itself ───────────────────────────────────────
+# bitarray             # jasmap/jasmap_bed.py only (not imported by JasMAP2.py)
+# torch, h5py          # removed from jasmap/parse.py; no longer a dependency
+# cffi, pandas-plink   # replaced by bed-reader above
+# scikit-allel         # replaced by the built-in pure-Python VCF parser above

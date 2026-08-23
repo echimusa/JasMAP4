@@ -1,0 +1,86 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---- Virtual environments ----
+venv/
+venv*/
+.venv/
+env/
+ENV/
+
+# ---- JasMAP generated output ----
+# NOTE: --consgwas writes its output to a SUBFOLDER literally named
+# "consensus_gwas" inside whatever --out directory you pass (e.g.
+# out_foo/consensus_gwas/). That is the SAME NAME as the source package
+# jasmap/consensus_gwas/ (the actual 8-step ConsensusGWAS engine). A glob
+# pattern like "*/consensus_gwas/" matches BOTH, and git ignores an entire
+# directory tree once the folder itself matches -- so a naive pattern here
+# would silently exclude the engine's source code from every commit with no
+# warning. The patterns below only ever match generated *top-level* output
+# folders (jasmap_results/, out_*/, results/), which already recursively
+# cover their own nested consensus_gwas/rvat_results/etc. subfolders --
+# no separate pattern for those subfolder names is needed or safe to add.
+jasmap_results/
+out_*/
+results/
+
+# Explicit safety net: never let any rule above accidentally exclude the
+# actual jasmap/ source package, even if --out is pointed at the project root.
+!/jasmap/
+!/jasmap/**
+
+# ---- JasMAP intermediate + log files ----
+*.tmp.tped
+jasmap-*.log
+*.assoc
+*.RVAT.assoc
+*.RVAT.summary
+
+# ---- Generated test data (regenerate with make_test_data.py) ----
+test_data/
+test_data_*/
+test_small/
+test_large/
+
+# ---- Generated figures ----
+# plots.py is source and IS tracked; these are run outputs only.
+out_*/**/*.png
+jasmap_results/**/*.png
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
+
+# ---- Large data files (never commit genotype data) ----
+# NOTE: *.bed is intended for PLINK BINARY GENOTYPE files, but ".bed" is
+# ALSO a completely unrelated plain-text genome-annotation format (chrom/
+# start/stop/name) -- which is exactly what --gene-annot consumes and what
+# --annot writes. A bare "*.bed" therefore silently excludes annotation
+# files too, with no warning: the same class of hazard as the
+# consensus_gwas/ collision documented above, and verified with a real
+# `git add -A` (a gene_annotation.bed was being dropped from every commit).
+# PLINK genotype .bed files always travel with .bim/.fam siblings;
+# annotation BEDs never do. The negations below re-include the
+# annotation-style names this project actually produces, so a curated
+# annotation can be version-controlled while real genotype data still
+# cannot be committed by accident.
+*.bed
+!*annotation*.bed
+!*annot*.bed
+!*_regions.bed
+*.bim
+*.fam
+*.vcf
+*.vcf.gz
+*.bgen
+*.h5
+*.hdf5
