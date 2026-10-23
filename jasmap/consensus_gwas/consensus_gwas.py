@@ -639,7 +639,21 @@ class ConsensusGWAS:
             df["se"]    = pd.to_numeric(df["se"],   errors="coerce")
             df["tool"]  = tool
             df["snp"]   = df["snp"].astype(str)
-            standardised[tool] = df[CANONICAL].dropna(subset=["pval"])
+            # Preserve admixture-mapping WINDOW COORDINATES alongside the
+            # canonical columns. Step 8's window annotation needs CHR/
+            # START_BP/END_BP to test which SNPs fall inside each window, and
+            # a bare df[CANONICAL] silently dropped them here -- so the
+            # annotation returned early with no columns added and no error.
+            # Only kept when actually present, so every other tool's schema
+            # is unchanged.
+            # Step 3's rename_map already folds CHR -> "chr" and
+            # START_BP -> "pos" (both are in CANONICAL, so they survive).
+            # END_BP has no canonical equivalent and is the one window column
+            # that would otherwise be dropped -- keep it so Step 8 can
+            # reconstruct each window's interval as [pos, END_BP].
+            extra = [c for c in ("END_BP",) if c in df.columns]
+            standardised[tool] = (df[CANONICAL + extra]
+                                  .dropna(subset=["pval"]))
         self._tool_results = standardised
         self._provenance["step3"] = "canonical schema applied"
 
@@ -880,7 +894,98 @@ class ConsensusGWAS:
         ] if self._consensus_df is not None else pd.DataFrame()
         sig_snps = set(sig_df["snp"].astype(str).tolist())
         concordant_in_consensus = len(sig_snps & concordant_snps)
-        logger.info(f"  Cross-tool concordance: {concordance_frac:.3f}")
+
+        # Interpretability fix (same class as the neighbouring one below, which
+        # was fixed earlier while this line was left behind). cross_tool_
+        # concordance() computes "of the SNPs significant in ANY tool, what
+        # fraction are significant in >=2 tools". When NO tool has a single
+        # significant SNP, both numerator and denominator are empty and the
+        # function returns 0/max(0,1) = 0.000 -- which reads as "the tools
+        # completely disagree" when the truth is "there was nothing to agree
+        # about". Those are opposite conclusions, and the misleading one would
+        # reasonably alarm a reader: confirmed on a real run where all three
+        # tools had lambda_GC between 0.990 and 0.995, i.e. were behaving
+        # essentially perfectly, yet the log reported concordance 0.000.
+        #
+        # When undefined, a rank correlation of p-values across tools is
+        # reported instead. That answers the question the reader actually has
+        # ("do these tools agree?") using every variant rather than only the
+        # significant ones, and is well defined precisely when the hit-based
+        # measure is not.
+        n_any_sig = len({s for t in self._tool_results
+                         for s in self._tool_results[t].loc[
+                             self._tool_results[t]["pval"] < self._sig_thresh,
+                             "snp"].astype(str)})
+        if n_any_sig == 0:
+            tools = list(self._tool_results.keys())
+            corr_txt = ""
+            if len(tools) >= 2:
+                try:
+                    from scipy.stats import spearmanr
+                    # Two corrections to an earlier version of this block,
+                    # both exposed by a real --mode gift run that reported a
+                    # median rho of 0.096 while ols and firth_approx were
+                    # plainly in near-perfect agreement:
+                    #
+                    # 1. Compare each PAIR on that pair's OWN shared variants,
+                    #    not on a global inner join across every tool. The
+                    #    global join is limited by the SMALLEST tool -- adding
+                    #    'gift' (5,000 pre-filtered SNPs) shrank the ols-vs-
+                    #    firth comparison from 272,791 variants to 5,000 for
+                    #    no reason.
+                    #
+                    # 2. Do not reduce to a single median. Some "tools" here
+                    #    are rank transforms of importance scores rather than
+                    #    hypothesis tests ('gift', 'gift_admix' -- flagged
+                    #    elsewhere as uniform by construction). Their p-values
+                    #    CANNOT correlate with a real test's, so every pair
+                    #    involving them sits near zero and drags a median down,
+                    #    hiding the one comparison that is actually meaningful.
+                    #    Pairs are now listed individually, with such tools
+                    #    marked, so a reader can see which agreements matter.
+                    RANK_XFORM = {"gift", "gift_admix"}
+                    pairs = []
+                    for i in range(len(tools)):
+                        for j in range(i + 1, len(tools)):
+                            a, b = tools[i], tools[j]
+                            m = (self._tool_results[a][["snp", "pval"]]
+                                 .rename(columns={"pval": "pa"})
+                                 .merge(self._tool_results[b][["snp", "pval"]]
+                                        .rename(columns={"pval": "pb"}),
+                                        on="snp"))
+                            if len(m) <= 10:
+                                continue
+                            r = spearmanr(m["pa"], m["pb"]).correlation
+                            if r != r:
+                                continue
+                            mark = "*" if (a in RANK_XFORM or b in RANK_XFORM) else ""
+                            pairs.append((f"{a} vs {b}{mark}", r, len(m)))
+                    if pairs:
+                        real = [r for lbl, r, _ in pairs if not lbl.endswith("*")]
+                        detail = "; ".join(f"{lbl} rho={r:.3f} (n={n:,})"
+                                          for lbl, r, n in pairs)
+                        corr_txt = (f" Pairwise Spearman rho of p-values -- "
+                                   f"{detail}.")
+                        if real:
+                            corr_txt += (f" Among genuine hypothesis tests only, "
+                                        f"median rho={float(np.median(real)):.3f} "
+                                        f"(1.0 = identical ranking).")
+                        if len(real) < len(pairs):
+                            corr_txt += (" (*) involves a rank-transformed "
+                                        "importance score rather than a real "
+                                        "test, so a near-zero rho there is "
+                                        "expected by construction and is not "
+                                        "evidence of disagreement.")
+                except Exception:
+                    pass
+            logger.info(
+                f"  Cross-tool concordance: N/A -- no tool reported a single "
+                f"variant below {self._sig_thresh:.2e}, so there is nothing "
+                f"for the tools to agree or disagree about (this is NOT a "
+                f"concordance of zero).{corr_txt}")
+        else:
+            logger.info(f"  Cross-tool concordance: {concordance_frac:.3f} "
+                       f"({n_any_sig} variant(s) significant in >=1 tool)")
         # Small interpretability fix: "0/0" (or, in principle, any N/0)
         # reads as a degenerate fraction rather than what it actually
         # means -- there were no consensus hits at all to check
@@ -905,12 +1010,196 @@ class ConsensusGWAS:
 
     # ── Step 8 ────────────────────────────────────────────────────────────────
 
+    def _annotate_am_windows(self, out):
+        """
+        Annotate SNP-level consensus rows with overlapping admixture-mapping
+        window evidence (Option 2: annotation, NOT combination).
+
+        Why annotation rather than merging into the consensus statistic
+        ---------------------------------------------------------------
+        Admixture-mapping results are keyed by genomic WINDOW, and folding a
+        window's p-value into the SNPs it spans would be wrong in three
+        separate ways:
+
+          * Different hypothesis. The window test asks whether local ANCESTRY
+            dosage associates with phenotype; the SNP test asks whether ALLELE
+            dosage does. Related claims, not the same claim.
+          * Manufactured independence. IVW meta-analysis assumes independent
+            estimates. Assigning one window p-value to its ~50 constituent
+            SNPs makes the consensus treat a single test as ~50 perfectly
+            correlated ones, so it becomes over-confident and no longer
+            controls the false-positive rate.
+          * Incompatible units and thresholds. Window beta is effect per unit
+            ancestry, SNP beta is effect per allele -- averaging them is
+            meaningless. And ~10,910 windows implies a Bonferroni threshold
+            around 4.6e-6, not the SNP-level 5e-8; applying the SNP threshold
+            would discard admixture mapping's main advantage, which is testing
+            far fewer hypotheses.
+
+        So these columns are purely interpretive: they let a reader ask "does
+        this SNP sit inside a locus where ancestry itself is associated?"
+        without any window evidence entering pval_consensus. The principled
+        way to let ancestry evidence actually sharpen a SNP inference is the
+        Bayesian joint model in --mode admix (its Joint_PPA column), which
+        uses the admixture-mapping result as a PRIOR rather than as another
+        co-equal p-value.
+
+        Columns added (all NaN/empty when no window overlaps the SNP):
+            AM_window        window id of the most significant overlapping window
+            AM_ancestry      which ancestry k gave that minimum p-value
+            AM_pval          that window's p-value
+            AM_significant   True if AM_pval passes the WINDOW-appropriate
+                             Bonferroni threshold (0.05 / n_windows_tested),
+                             NOT the SNP-level threshold
+        """
+        am_tools = {t: df for t, df in self._tool_results.items()
+                    if t.startswith("admix_map_k")}
+        if not am_tools:
+            return out
+        # Post-Step-3 names: CHR -> "chr", START_BP -> "pos", END_BP kept.
+        need = {"chr", "pos", "END_BP", "pval"}
+        usable = {t: df for t, df in am_tools.items() if need.issubset(df.columns)}
+        if not usable:
+            logger.info("[ConsensusGWAS] Admixture-mapping results lack "
+                       "chr/pos/END_BP -- skipping window annotation.")
+            return out
+        if not {"chr", "pos"}.issubset(out.columns):
+            logger.info("[ConsensusGWAS] Consensus table lacks chr/pos -- "
+                       "skipping window annotation.")
+            return out
+
+        # Window-appropriate multiple-testing threshold: the number of
+        # DISTINCT windows tested, not the number of window x ancestry rows
+        # and not the number of SNPs.
+        all_win = pd.concat(usable.values(), ignore_index=True)
+        n_windows = int(all_win["snp"].nunique()) if "snp" in all_win.columns else len(all_win)
+        # Account for testing several ancestries at EVERY window, not just the
+        # window count. An earlier version divided by n_windows alone, which
+        # is mildly anti-conservative: with K=5 that gave 4.58e-06 when 54,550
+        # window x ancestry tests were actually performed.
+        #
+        # K x n_windows would be too strict in the other direction, because
+        # ancestry proportions at a locus are constrained to sum to 1 -- only
+        # K-1 of them are independent, so the K tests at a window are heavily
+        # correlated rather than separate. (K-1) x n_windows is the defensible
+        # middle ground and is what standard admixture-mapping practice
+        # implies.
+        n_anc = max(len(usable), 1)
+        n_eff_tests = max(n_windows * max(n_anc - 1, 1), 1)
+        win_thresh = 0.05 / n_eff_tests
+
+        # Report the actual p-value distribution rather than only a pass/fail
+        # count against one threshold. Bonferroni is a POOR correction for
+        # admixture mapping: local ancestry is strongly autocorrelated along a
+        # chromosome, so adjacent windows are far from independent and the
+        # effective number of tests is much smaller than n_windows x (K-1) --
+        # typically hundreds to low thousands genome-wide rather than tens of
+        # thousands. That makes this threshold conservative, while dividing by
+        # n_windows alone (an earlier version) was anti-conservative. Neither
+        # is defensible as THE answer.
+        #
+        # Rather than pick an arbitrary point on that spectrum and report a
+        # bare count, the observed minimum and the near-threshold band are
+        # logged so the strength of evidence is visible and the reader can
+        # apply their own criterion. A permutation-based threshold (shuffling
+        # phenotype, retaining the ancestry autocorrelation structure) is the
+        # principled way to settle this, and is the recommended next step if
+        # any window looks promising.
+        _wp = pd.to_numeric(all_win["pval"], errors="coerce").dropna()
+        if len(_wp):
+            _expected_min = 1.0 / n_eff_tests
+            logger.info(
+                f"[ConsensusGWAS] Admixture-mapping window p-values: "
+                f"min={_wp.min():.3e}, 5th smallest="
+                f"{_wp.nsmallest(min(5, len(_wp))).iloc[-1]:.3e}. "
+                f"Under the null with {n_eff_tests:,} tests the expected "
+                f"minimum is ~{_expected_min:.2e}. "
+                f"{int((_wp <= win_thresh).sum())} window-test(s) pass "
+                f"Bonferroni {win_thresh:.2e}; "
+                f"{int((_wp <= 1e-4).sum())} fall below 1e-4.")
+            logger.info(
+                "[ConsensusGWAS] NOTE: Bonferroni is conservative here because "
+                "adjacent windows share ancestry tracts and are not "
+                "independent. Treat the count above as a lower bound, and use "
+                "a permutation-based threshold before calling any window "
+                "significant.")
+
+        # Annotate only genuine SNP rows. The consensus table also contains
+        # the window rows themselves (they were carried alongside rather than
+        # merged -- see the note in collect_mode_results), and annotating a
+        # window with its own evidence is circular and meaningless. Window
+        # rows are identified by having NO p-value from any SNP-level tool.
+        snp_level_cols = [c for c in out.columns
+                          if c.startswith("pval_")
+                          and not c.startswith("pval_admix_map_k")
+                          and c not in ("pval_consensus", "pval_heterogeneity")]
+        if snp_level_cols:
+            is_snp_row = out[snp_level_cols].notna().any(axis=1).values
+        else:
+            is_snp_row = np.ones(len(out), dtype=bool)
+
+        snp_chr = out["chr"].astype(str).str.replace("chr", "", regex=False).values
+        snp_pos = pd.to_numeric(out["pos"], errors="coerce").values
+        snp_pos = np.where(is_snp_row, snp_pos, np.nan)   # window rows excluded
+
+        best_p = np.full(len(out), np.nan)
+        best_win = np.array([""] * len(out), dtype=object)
+        best_anc = np.array([""] * len(out), dtype=object)
+
+        for tool, df in usable.items():
+            anc = tool.replace("admix_map_k", "")
+            w_chr = df["chr"].astype(str).str.replace("chr", "", regex=False).values
+            w_s = pd.to_numeric(df["pos"], errors="coerce").values
+            w_e = pd.to_numeric(df["END_BP"], errors="coerce").values
+            w_p = pd.to_numeric(df["pval"], errors="coerce").values
+            w_id = (df["snp"].astype(str).values if "snp" in df.columns
+                    else np.arange(len(df)).astype(str))
+            for c in np.unique(w_chr):
+                s_mask = snp_chr == c
+                if not s_mask.any():
+                    continue
+                s_idx = np.flatnonzero(s_mask)
+                w_mask = np.flatnonzero(w_chr == c)
+                for wi in w_mask:
+                    if not (np.isfinite(w_s[wi]) and np.isfinite(w_e[wi])
+                            and np.isfinite(w_p[wi])):
+                        continue
+                    inside = s_idx[(snp_pos[s_idx] >= w_s[wi]) &
+                                   (snp_pos[s_idx] <= w_e[wi])]
+                    if not len(inside):
+                        continue
+                    better = inside[np.isnan(best_p[inside]) |
+                                    (w_p[wi] < best_p[inside])]
+                    best_p[better] = w_p[wi]
+                    best_win[better] = w_id[wi]
+                    best_anc[better] = anc
+
+        out = out.copy()
+        out["AM_window"] = best_win
+        out["AM_ancestry"] = best_anc
+        out["AM_pval"] = best_p
+        out["AM_significant"] = np.where(np.isnan(best_p), False,
+                                         best_p <= win_thresh)
+        n_ann = int((~np.isnan(best_p)).sum())
+        n_sig = int(out["AM_significant"].sum())
+        logger.info(
+            f"[ConsensusGWAS] Annotated {n_ann:,} of {len(out):,} SNP row(s) "
+            f"with overlapping admixture-mapping window evidence "
+            f"({n_windows:,} distinct windows x {n_anc} ancestries; "
+            f"window-level Bonferroni threshold {win_thresh:.2e} = "
+            f"0.05/({n_windows:,}x{max(n_anc-1,1)}), NOT the SNP threshold). "
+            f"{n_sig:,} SNP(s) sit inside a window significant for ancestry. "
+            f"These columns are INTERPRETIVE ONLY -- no window evidence "
+            f"enters pval_consensus (see _annotate_am_windows() for why).")
+        return out
+
     def _step8_write_outputs(self):
         """Step 8: write consensus stats + per-tool provenance + plots."""
         logger.info("[ConsensusGWAS] Step 8 - writing outputs ...")
 
         # Sort by consensus p-value
         out = self._consensus_df.sort_values("pval_consensus").reset_index(drop=True)
+        out = self._annotate_am_windows(out)
         out.to_csv(self.out_dir / "consensus_snp_stats.tsv", sep="\t", index=False)
 
         # Inflation / lambda report
@@ -1128,8 +1417,16 @@ class ConsensusGWAS:
                         # Count tools significant at nominal level
                         sig_cols = [c for c in gene_df.columns if c.startswith("pval_")
                                     and c != "pval_consensus"]
-                        gene_df["n_tools_significant"] = gene_df[sig_cols].apply(
-                            lambda r: (r < 0.05).sum(), axis=1)
+                        # Performance fix: this was
+                        #   .apply(lambda r: (r < 0.05).sum(), axis=1)
+                        # which runs a Python lambda once per gene. The same
+                        # count is a single vectorised comparison plus a row
+                        # sum, which pandas does in C -- identical result,
+                        # no per-row interpreter overhead as gene counts grow
+                        # (a whole-exome annotation is ~20,000 rows, and the
+                        # auto-built --annot file can exceed 27,000).
+                        gene_df["n_tools_significant"] = (
+                            (gene_df[sig_cols] < 0.05).sum(axis=1))
                         gene_df["dom_csq"] = gene_df["snp"].map(csq_per_gene).fillna("other")
                         logger.info(f"[ConsensusGWAS] Aggregated {len(gene_df)} genes for RVAT plots")
 
@@ -1150,10 +1447,20 @@ class ConsensusGWAS:
             # reasonable, honestly-labelled thing to show (the user
             # explicitly asked for a gene-based analysis in that case).
             if gene_df is None and self.mode != "rvat":
-                logger.info("[ConsensusGWAS] Skipping RVAT-style plots: no "
-                           "gene-level aggregation available for this "
-                           f"SNP-level mode ({self.mode}) -- pass "
-                           "--gene-annot for real gene-level plots.")
+                # Message fix: this used to end "-- pass --gene-annot for real
+                # gene-level plots", which is misleading here. The skip is
+                # driven by the MODE being SNP-level, not by a missing
+                # annotation: a real --mode GWAS run that had already supplied
+                # an annotation (via --annot, which sets gene_annot) still saw
+                # this message telling it to supply one. Naming the actual
+                # reason avoids sending users to change a flag that would not
+                # alter the outcome.
+                logger.info("[ConsensusGWAS] Skipping RVAT-style plots: "
+                           f"--mode {self.mode} is a SNP-level analysis and "
+                           "produces no gene-level aggregation for these "
+                           "plots to show. This is independent of "
+                           "--gene-annot/--annot; use --mode rvat for "
+                           "gene-based results.")
             else:
                 if gene_df is None:
                     gene_df = df.copy()
@@ -1460,6 +1767,36 @@ def collect_mode_results(mode, outfolder, bim=None):
             df = df.rename(columns={"P":"pval","BETA":"beta",
                                     "WINDOW":"snp"})
             df["snp"] = df["snp"].astype(str)
+            # Honesty note, not a silent behaviour change: these rows are keyed
+            # by WINDOW index, not SNP id. Admixture mapping tests a genomic
+            # WINDOW (CHR/START_BP/END_BP are in the source file) spanning many
+            # SNPs, so a window key can never match a SNP key from the
+            # SNP-level tools (ols/firth_approx/gift_admix). The consequence,
+            # confirmed on a real run: the consensus reported 283,701
+            # "variants" = 272,791 SNPs + 10,910 windows, i.e. the window rows
+            # were appended ALONGSIDE the SNP rows rather than contributing
+            # evidence to them. Those rows therefore carry a single tool's
+            # p-value each, and the headline variant count is not a variant
+            # count.
+            #
+            # Left as-is deliberately: propagating a window's evidence onto
+            # every SNP it spans changes what the consensus statistic MEANS
+            # (many SNPs would inherit one identical, non-independent test
+            # result), which is a methodological decision rather than a bug
+            # fix. Flagged here so the count and the Manhattan plot are read
+            # correctly, and so the choice is explicit rather than accidental.
+            n_win = len(df)
+            n_k = df["ANCESTRY_K"].nunique() if "ANCESTRY_K" in df.columns else 0
+            logger.info(
+                f"[ConsensusGWAS] Note: the 'admix_map_k*' tools are keyed by "
+                f"genomic WINDOW ({n_win} window-rows across {n_k} ancestries), "
+                f"not by SNP. Window keys cannot match the SNP-level tools' "
+                f"keys, so these rows are carried ALONGSIDE the SNP rows in "
+                f"the consensus rather than combined with them -- they add to "
+                f"the reported row count without contributing to any SNP's "
+                f"consensus statistic. Read per-ancestry admixture-mapping "
+                f"evidence from the admixture_mapping.tsv output directly; it "
+                f"has CHR/START_BP/END_BP for locating each window.")
             for k_val in df["ANCESTRY_K"].unique():
                 sub = df[df["ANCESTRY_K"]==k_val].copy()
                 results[f"admix_map_k{k_val}"] = sub

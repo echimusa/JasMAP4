@@ -66,11 +66,173 @@ def load_pheno_file(path):
         return df, False
 
 
+def load_fam_file(path):
+    """PLINK .fam: FID IID PAT MAT SEX PHENO (column 6 is the phenotype)."""
+    df = pd.read_csv(path, sep=r"\s+", header=None,
+                     names=["FID", "IID", "PAT", "MAT", "SEX", "PHENO"],
+                     engine="python", dtype={"FID": str, "IID": str})
+    df["PHENO"] = pd.to_numeric(df["PHENO"], errors="coerce")
+    return df
+
+
+def build_pheno_from_fam(args):
+    """
+    Build a correct --pheno from the .fam's own phenotype column.
+
+    Why this mode exists
+    --------------------
+    The original --fix mode could only CORRECT an existing --pheno: it forced
+    reference samples to the missing code and left everything else alone. That
+    is useless when the --pheno file itself carries no information -- found on
+    real data, where every one of 733 admixed samples was coded 0, so --fix
+    faithfully preserved 733 zeros and the "corrected" file was as
+    uninformative as the original. The real case/control status was sitting
+    in the .fam's column 6 the whole time.
+
+    Three normalisations are applied, each reported rather than silent:
+
+      1. Reference-population samples (any label in --pop-file other than
+         --admix-label) are set to the missing code, regardless of what the
+         .fam says. This catches genotype panels where reference samples
+         carry a stray phenotype value -- confirmed on real data, where 8
+         CEU reference samples were coded 2 (case), which is exactly the
+         kind of leak that inflates a study cohort with samples that were
+         never phenotyped.
+
+      2. Non-standard missing codes in the .fam are normalised. PLINK's
+         convention is -9, but 0 is also conventionally missing for
+         case/control, and real files use a bare 9 (confirmed: 622 samples).
+         All of {0, 9, -9, blank} become --missing-code.
+
+      3. Everything else is passed through untouched. Genuine 1/2
+         (control/case) values are never modified.
+    """
+    if not args.fam:
+        print("ERROR: --from-fam requires --fam <path to .fam>", file=sys.stderr)
+        sys.exit(1)
+    if not args.out:
+        print("ERROR: --from-fam requires --out <output .pheno path>", file=sys.stderr)
+        sys.exit(1)
+
+    pop_df = load_pop_file(args.pop_file)
+    fam_df = load_fam_file(args.fam)
+
+    unique_labels = sorted(pop_df["POP"].unique().tolist())
+    if args.admix_label not in unique_labels:
+        print(f"ERROR: --admix-label {args.admix_label!r} does not match any "
+              f"label in --pop-file. Labels found: {unique_labels}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    print(f".fam:       {len(fam_df)} samples ({args.fam})")
+    print(f"--pop-file: {len(pop_df)} samples ({args.pop_file})")
+
+    # load_pop_file() names its columns ID/POP, not IID/POP -- merge on the
+    # actual column names rather than assuming they match.
+    merged = fam_df.merge(pop_df, left_on="IID", right_on="ID",
+                          how="left", indicator=True)
+    unlabelled = merged[merged["_merge"] == "left_only"]
+    if len(unlabelled):
+        print(f"\n[WARNING] {len(unlabelled)} sample(s) in the .fam have no "
+              f"--pop-file label and will be treated as reference (set to "
+              f"{args.missing_code:g}): "
+              f"{unlabelled['IID'].tolist()[:10]}"
+              f"{' ...' if len(unlabelled) > 10 else ''}")
+
+    is_admix = (merged["POP"] == args.admix_label).fillna(False)
+    raw = merged["PHENO"]
+
+    MISSING_LIKE = {0, 9, -9}
+    looks_missing = raw.isna() | raw.isin(MISSING_LIKE)
+
+    print(f"\n{'='*70}")
+    print("SOURCE: .fam column 6, by population")
+    print(f"{'='*70}")
+    tab = pd.crosstab(merged["POP"].fillna("(unlabelled)"), raw.fillna("NA"))
+    print(tab.to_string())
+
+    out = pd.DataFrame({
+        "FID": merged["FID"], "IID": merged["IID"],
+        "PHENO": raw.copy()})
+
+    n_ref_overridden = int((~is_admix & ~looks_missing).sum())
+    ref_detail = (merged[~is_admix & ~looks_missing]
+                  .groupby("POP")["IID"].apply(list))
+    out.loc[~is_admix, "PHENO"] = args.missing_code
+
+    n_norm = int((is_admix & looks_missing).sum())
+    out.loc[is_admix & looks_missing, "PHENO"] = args.missing_code
+
+    kept = out.loc[is_admix & ~looks_missing, "PHENO"]
+
+    print(f"\n{'='*70}")
+    print("ACTIONS TAKEN")
+    print(f"{'='*70}")
+    if n_ref_overridden:
+        print(f"[FIXED] {n_ref_overridden} reference-population sample(s) had a "
+              f"real phenotype in the .fam and were set to "
+              f"{args.missing_code:g} (they are not part of the phenotyped "
+              f"study cohort):")
+        for lab, ids in ref_detail.items():
+            print(f"    {lab}: {len(ids)} -- e.g. {ids[:5]}"
+                  f"{' ...' if len(ids) > 5 else ''}")
+    else:
+        print("[OK] No reference-population sample carried a stray phenotype.")
+    if n_norm:
+        print(f"[NORMALISED] {n_norm} admixed sample(s) had a missing-like code "
+              f"(0/9/-9/blank) normalised to {args.missing_code:g}.")
+
+    print(f"\n{'='*70}")
+    print("RESULT")
+    print(f"{'='*70}")
+    if len(kept) == 0:
+        print("[PROBLEM] After correction, NO admixed sample has a usable "
+              "phenotype. Association testing is impossible on this data -- "
+              "check that the .fam really contains case/control status.")
+    else:
+        vc = kept.value_counts().sort_index()
+        print(f"{len(kept)} admixed sample(s) with a usable phenotype:")
+        for val, n in vc.items():
+            label = {1: "control", 2: "case"}.get(int(val), "value")
+            print(f"    {int(val)} ({label}): {n}")
+        if len(vc) < 2:
+            print("\n[PROBLEM] Only ONE distinct phenotype value. Association "
+                  "tests, AUC and lambda_GC are all undefined without "
+                  "variation -- this is what produces nan results.")
+        else:
+            frac = vc.max() / vc.sum()
+            print(f"\n[OK] Genuine phenotype variation present.")
+            if frac > 0.75:
+                print(f"[NOTE] Heavily imbalanced ({100*frac:.1f}% in the "
+                      f"largest class). Valid, but expect wide confidence "
+                      f"intervals, and interpret AUC with that in mind.")
+    print(f"{int((out['PHENO'] == args.missing_code).sum())} sample(s) coded "
+          f"missing ({args.missing_code:g}) in total.")
+
+    out["PHENO"] = out["PHENO"].astype(float).round().astype(int)
+    out.to_csv(args.out, sep="\t", header=False, index=False)
+    print(f"\nWrote corrected --pheno -> {args.out}")
+    print(f"Use it with:  --pheno {args.out}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--pop-file", required=True, help="Path to --pop-file (sample_ID, POP_LABEL)")
-    p.add_argument("--pheno", required=True, help="Path to --pheno file")
+    p.add_argument("--pheno", required=False, default=None,
+                  help="Path to an existing --pheno file to CHECK. Optional "
+                       "when --from-fam is used to build one from scratch.")
+    p.add_argument("--fam", default=None,
+                  help="Path to the PLINK .fam file. Column 6 is the "
+                       "phenotype; used as the authoritative source with "
+                       "--from-fam.")
+    p.add_argument("--from-fam", action="store_true",
+                  help="BUILD a corrected --pheno from --fam's column 6 "
+                       "rather than checking an existing --pheno. Reference-"
+                       "population samples (per --pop-file) are forced to "
+                       "--missing-code, and any non-standard missing codes "
+                       "in the .fam (0, 9) are normalised to --missing-code. "
+                       "Requires --fam and --out.")
     p.add_argument("--admix-label", default="ADMIX",
                   help="The population label identifying admixed study-cohort "
                        "samples (default: ADMIX, matching JasMAP4's own default)")
@@ -84,6 +246,15 @@ def main():
     p.add_argument("--out", default=None,
                   help="Output path for the corrected file (required with --fix)")
     args = p.parse_args()
+
+    if args.from_fam:
+        build_pheno_from_fam(args)
+        return
+
+    if not args.pheno:
+        print("ERROR: --pheno is required unless --from-fam is given.",
+              file=sys.stderr)
+        sys.exit(1)
 
     pop_df = load_pop_file(args.pop_file)
     pheno_df, has_ids = load_pheno_file(args.pheno)

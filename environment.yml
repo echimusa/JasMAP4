@@ -1,0 +1,29 @@
+# JasMAP4 conda environment -- the recommended install on HPC clusters.
+#
+#   conda env create -f environment.yml      # or: mamba env create -f environment.yml
+#   conda activate jasmap
+#
+# Why conda rather than pip on a cluster: pip compiles from source whenever
+# no prebuilt wheel matches the cluster's Python version, CPU architecture or
+# (often old) system C library -- and clusters rarely have a working C/Cython
+# toolchain, so the build fails, e.g.
+#     "meson.build: ERROR: Compiler cython cannot compile programs"
+#     "Failed to build 'pandas' when installing build dependencies for pandas"
+# conda-forge ships prebuilt binaries and resolves every package against the
+# others at once, so nothing is compiled and the numpy<2 constraint is honoured
+# across the whole stack. Pins mirror requirements.txt; see the notes there for
+# why numpy<2 and pyarrow<17 are required.
+name: jasmap
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy=1.26
+  - pandas
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - polars
+  - pyarrow=16
+  - certifi
+  - bed-reader

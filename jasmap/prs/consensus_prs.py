@@ -1339,7 +1339,7 @@ def run_prs(G, y, bim, fam, out_prefix,
             ancestry_labels=None,
             X0=None,
             max_snps=20000,
-            test_frac=0.2, seed=42,
+            test_frac=0.2, seed=42, holdout_idx=None,
             restrict_output_idx=None,
             plots=True):
     """
@@ -1414,9 +1414,49 @@ def run_prs(G, y, bim, fam, out_prefix,
     # the test indices are intentionally discarded (_) since the portability
     # fix moved final validation to ALL samples rather than the test split
     # only (see validate_prs() docstring for why).
-    tr, _ = idx[:split], idx[split:]
+    tr, te = idx[:split], idx[split:]
+    # If the caller already chose the held-out split (because it had to mask
+    # those samples out of an upstream SNP pre-filter to avoid feature-
+    # selection leakage), honour THAT split rather than drawing an independent
+    # one. Two different splits would silently defeat the masking: samples
+    # hidden from the screen could land back in training here, and screened
+    # samples could become the "held-out" set.
+    if holdout_idx is not None and len(holdout_idx):
+        te = np.asarray(holdout_idx, dtype=int)
+        tr = np.setdiff1d(valid_idx, te)
+        logger.info(f"[PRS] Using the caller-supplied held-out split "
+                   f"({len(tr)} train / {len(te)} held-out) so it matches the "
+                   f"samples masked out of the SNP pre-filter.")
     G_tr, y_tr = G[tr], y[tr]
     X0_tr = X0[tr, :] if X0 is not None else None
+
+    # Diagnostic: warn up front when the model is so heavily
+    # overparameterised that overfitting is a certainty rather than a risk.
+    # A regularised linear model with far more predictors than samples can
+    # fit its training data almost perfectly while learning nothing that
+    # generalises -- which shows up as a large in-sample/held-out gap and is
+    # easy to misread as a pipeline failure. Confirmed on real data: 20,000
+    # SNPs against 586 training samples (34x) gave in-sample AUC 0.972 and
+    # held-out AUC 0.494. Stating the ratio before fitting makes that
+    # outcome interpretable when it appears, instead of surprising.
+    _p_over_n = G_tr.shape[1] / max(len(tr), 1)
+    if _p_over_n > 2:
+        logger.warning(
+            f"[PRS] {G_tr.shape[1]:,} predictor SNPs vs {len(tr)} training "
+            f"sample(s) ({_p_over_n:.1f}x more predictors than samples). "
+            f"Expect a large gap between in-sample and held-out performance; "
+            f"the held-out figure is the meaningful one. If it comes out near "
+            f"chance, consider a much smaller --prs-max-snps (hundreds rather "
+            f"than tens of thousands), which is the standard remedy when a "
+            f"cohort is small relative to the panel.")
+    _n_classes = np.unique(y_tr[~np.isnan(y_tr)])
+    if len(_n_classes) == 2:
+        _minor = min((y_tr == c).sum() for c in _n_classes)
+        if _minor < 100:
+            logger.warning(
+                f"[PRS] The smaller phenotype class has only {int(_minor)} "
+                f"training sample(s). Held-out metrics will be noisy and "
+                f"confidence intervals wide regardless of model quality.")
 
     model = ConsensusPRS(methods=methods, seed=seed, max_snps=max_snps)
     model.fit(G_tr, y_tr, sumstats_df=sumstats_df, bim=bim, X0=X0_tr)
@@ -1437,6 +1477,59 @@ def run_prs(G, y, bim, fam, out_prefix,
     validation = validate_prs(prs_scores[report_idx], y[report_idx],
                               ancestry_labels=([ancestry_labels[i] for i in report_idx]
                                                if ancestry_labels else None))
+
+    # Bug fix (reporting integrity): the metrics just computed are IN-SAMPLE.
+    # The model was fit on `tr`, but validation runs over all reported
+    # samples, which CONTAINS `tr` -- so those numbers measure how well the
+    # model reproduces data it was trained on, not how well it generalises.
+    # With p >> n (20,000 SNPs on 733 samples is routine here) a regularised
+    # linear model can very nearly memorise its training set, and the result
+    # is an AUC pinned near 1.0. Confirmed on real data: a first run with a
+    # correct phenotype reported AUC=1.000, r=0.982 for a complex infectious
+    # disease at n=733 -- a figure that is not plausible and would not
+    # survive review.
+    #
+    # The all-sample validation is kept, because the portability breakdown
+    # genuinely needs every sample to have enough per-ancestry group members.
+    # But the held-out split (`te`), which was previously computed and then
+    # discarded, is now ALSO evaluated and reported separately. Callers get
+    # both, explicitly labelled, so the honest generalisation estimate is
+    # available and the in-sample figure can never be mistaken for one.
+    validation["auc_in_sample"] = validation.get("auc")
+    validation["pearson_r_in_sample"] = validation.get("pearson_r")
+    validation["n_train"] = int(len(tr))
+    validation["n_holdout"] = int(len(te))
+
+    if len(te) >= 10:
+        te_report = np.intersect1d(te, report_idx)
+        if len(te_report) >= 10:
+            ho = validate_prs(prs_scores[te_report], y[te_report],
+                              ancestry_labels=([ancestry_labels[i] for i in te_report]
+                                               if ancestry_labels else None))
+            validation["auc_holdout"] = ho.get("auc")
+            validation["pearson_r_holdout"] = ho.get("pearson_r")
+            validation["cal_slope_holdout"] = ho.get("cal_slope")
+            logger.info(
+                f"[PRS] Held-out validation on {len(te_report)} sample(s) never "
+                f"seen during fitting: AUC={ho.get('auc', float('nan')):.3f}  "
+                f"r={ho.get('pearson_r', float('nan')):.3f}")
+            logger.info(
+                f"[PRS] NOTE: the AUC/r reported below are IN-SAMPLE (computed "
+                f"over all {len(report_idx)} reported samples, which include "
+                f"the {len(tr)} used for fitting) and will be optimistic. Use "
+                f"the held-out figures above as the generalisation estimate.")
+        else:
+            validation["auc_holdout"] = float("nan")
+            logger.warning(
+                f"[PRS] Only {len(te_report)} held-out sample(s) fall within the "
+                f"reported cohort -- too few for a generalisation estimate. The "
+                f"AUC/r below are IN-SAMPLE and will be optimistic.")
+    else:
+        validation["auc_holdout"] = float("nan")
+        logger.warning(
+            f"[PRS] Held-out split has only {len(te)} sample(s) -- too few for a "
+            f"generalisation estimate. The AUC/r below are IN-SAMPLE and will "
+            f"be optimistic.")
 
     # ── Outputs ───────────────────────────────────────────────────────────────
     out_df = fam.iloc[report_idx].copy()[["FID","IID"]].reset_index(drop=True)

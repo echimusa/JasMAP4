@@ -37,6 +37,7 @@ Two-tier memory strategy
 """
 
 import logging
+import os
 import time
 
 import numpy as np
@@ -46,7 +47,123 @@ logger = logging.getLogger(__name__)
 _BYTES_PER_ENTRY = 8  # float64
 
 
+class MemmapGenotypeBackend:
+    """
+    A `bed_reader.open_bed`-compatible reader backed by a binary memmap,
+    letting StreamingGenotypeSource work with --vcf and --geno input.
+
+    Why this exists
+    ---------------
+    The size-aware kinship/LMM dispatcher (exact / low-rank / conjugate-
+    gradient) is driven entirely by StreamingGenotypeSource, which read
+    genotypes exclusively through bed-reader. That hard-wired the whole
+    biobank-scale path to --bfile: JasMAP4.py set `_use_streaming_lmm =
+    False` unconditionally for EIGENSTRAT (--geno) and VCF (--vcf) input,
+    with the comment "no chunked-read mechanism for this format". The
+    scaling work therefore silently did not apply to two of the three
+    supported input formats.
+
+    The gap was never in the dispatcher -- it was that those formats had
+    no chunked reader to feed it. Both already get converted to a shared
+    intermediate .tped file early in the run, so the missing piece is
+    simply chunked column access to that file.
+
+    Reading the .tped text directly per chunk would be far too slow: it is
+    a tab-separated text file, so every pass would re-parse the whole
+    thing, and the randomized eigendecomposition makes several passes. So
+    the .tped is converted ONCE to a raw float32 binary alongside it, which
+    is then memory-mapped. Subsequent chunk reads are O(chunk) slicing with
+    no parsing at all, and the OS page cache handles residency -- the same
+    property that makes the .bed path fast.
+
+    Exposes exactly the three attributes/methods StreamingGenotypeSource
+    uses from open_bed -- `iid_count`, `sid_count`, and
+    `read(index=(rows, cols))` -- so the source class needs no special-
+    casing beyond choosing which backend to construct.
+    """
+
+    def __init__(self, tped_path, cache_dir=None, verbose=True):
+        self.tped_path = str(tped_path)
+        bin_path = self.tped_path + ".f32bin"
+        meta_path = self.tped_path + ".f32meta"
+
+        # Reuse an existing conversion when it is newer than the .tped, so a
+        # multi-pass run (or a re-run in the same output folder) pays the
+        # parse cost once rather than every time.
+        reuse = (os.path.exists(bin_path) and os.path.exists(meta_path)
+                 and os.path.getmtime(bin_path) >= os.path.getmtime(self.tped_path))
+
+        if reuse:
+            with open(meta_path) as fh:
+                n_snps, n_samples = (int(x) for x in fh.read().split())
+            if verbose:
+                logger.info(f"[streaming_io] Reusing cached binary genotype "
+                           f"conversion ({n_snps:,} SNPs x {n_samples:,} "
+                           f"samples) -> {bin_path}")
+        else:
+            n_snps, n_samples = self._convert(self.tped_path, bin_path, verbose)
+            with open(meta_path, "w") as fh:
+                fh.write(f"{n_snps} {n_samples}")
+
+        self._n_snps = n_snps
+        self._n_samples = n_samples
+        # Stored SNP-major (n_snps, n_samples), matching the .tped layout,
+        # so conversion is a straight streaming write with no transpose of
+        # the whole matrix in memory.
+        self._mm = np.memmap(bin_path, dtype=np.float32, mode="r",
+                             shape=(n_snps, n_samples))
+
+    @staticmethod
+    def _convert(tped_path, bin_path, verbose=True):
+        """One-time .tped -> raw float32 binary conversion, in row batches
+        so the full matrix is never held in memory at once."""
+        import polars as pl
+        if verbose:
+            logger.info(f"[streaming_io] Converting {tped_path} to a binary "
+                       f"genotype cache for chunked access (one-time cost; "
+                       f"reused on later passes and re-runs) ...")
+        t0 = time.time()
+        df = pl.read_csv(tped_path, separator="\t", null_values="NA")
+        n_snps = df.height
+        n_samples = df.width - 6
+        BATCH = 20000
+        with open(bin_path, "wb") as out:
+            for start in range(0, n_snps, BATCH):
+                end = min(start + BATCH, n_snps)
+                block = (df[start:end, 6:]
+                         .to_numpy()
+                         .astype(np.float32, copy=False))
+                out.write(np.ascontiguousarray(block).tobytes())
+        if verbose:
+            logger.info(f"[streaming_io] Converted {n_snps:,} SNPs x "
+                       f"{n_samples:,} samples in {time.time()-t0:.1f}s "
+                       f"({os.path.getsize(bin_path)/1e9:.2f} GB on disk).")
+        return n_snps, n_samples
+
+    # ---- open_bed-compatible surface -------------------------------------
+    @property
+    def iid_count(self):
+        return self._n_samples
+
+    @property
+    def sid_count(self):
+        return self._n_snps
+
+    def read(self, index=None):
+        """Mirrors bed_reader.open_bed.read(index=(row_sel, col_sel)),
+        where rows are SAMPLES and columns are SNPs. The memmap is stored
+        SNP-major, so this slices SNPs first and transposes the (small)
+        chunk to the (samples, SNPs) orientation callers expect."""
+        row_sel, col_sel = (None, None) if index is None else index
+        block = self._mm[col_sel, :] if col_sel is not None else self._mm[:, :]
+        block = np.asarray(block).T          # -> (n_samples, chunk_snps)
+        if row_sel is not None:
+            block = block[row_sel, :]
+        return block.astype(np.float32, copy=False)
+
+
 class StreamingGenotypeSource:
+
     """
     Wraps a PLINK .bed file (via bed-reader) and provides SNP-chunked,
     standardised access -- either cached in memory (small/medium data) or
@@ -85,9 +202,16 @@ class StreamingGenotypeSource:
                     pass (fast, matches the validated dense-array behaviour
                     exactly); otherwise stream fresh from disk every call.
         """
-        from bed_reader import open_bed
-        bed_path = bed_path if bed_path.endswith(".bed") else bed_path + ".bed"
-        self.bed = open_bed(bed_path, count_A1=False)
+        # Backend selection: a .tped path routes through the memmap backend
+        # (--vcf / --geno input), anything else through bed-reader (--bfile).
+        # Both expose the same iid_count / sid_count / read(index=...)
+        # surface, so nothing downstream in this class changes.
+        if str(bed_path).endswith((".tped", ".tmp.tped")):
+            self.bed = MemmapGenotypeBackend(bed_path, verbose=verbose)
+        else:
+            from bed_reader import open_bed
+            bed_path = bed_path if bed_path.endswith(".bed") else bed_path + ".bed"
+            self.bed = open_bed(bed_path, count_A1=False)
         self.sample_idx = sample_idx
         self.snp_idx = np.asarray(snp_idx) if snp_idx is not None else None
         self.n = self.bed.iid_count if sample_idx is None else len(sample_idx)

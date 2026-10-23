@@ -1,3 +1,33 @@
+# ═══ SUPPORTED PYTHON: 3.10 - 3.12 (3.12 recommended) ═══════════════════════
+#
+# ON AN HPC CLUSTER, USE environment.yml (conda-forge, no compiling) INSTEAD:
+#     conda env create -f environment.yml && conda activate jasmap
+#
+# Use a dedicated environment, e.g.:
+#     conda create -n jasmap python=3.12 -y && conda activate jasmap
+#     pip install -r requirements.txt
+#
+# Why this is pinned rather than left open -- two hard constraints that
+# BOTH bite on a too-new interpreter, confirmed on a real Python 3.14 setup:
+#
+#   1. bed-reader ships prebuilt wheels only up to recent Python versions.
+#      On an unsupported interpreter pip falls back to compiling it from
+#      Rust source, where PyO3 refuses to build:
+#          "the configured Python interpreter version (3.14) is newer than
+#           PyO3's maximum supported version (3.13)"
+#      The suggested PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 workaround is NOT
+#      recommended: it forces an untested build of the library that reads
+#      your genotype data, and needs a Rust toolchain besides.
+#
+#   2. numpy<2 is required (see the note on numpy below), and numpy 1.26.x
+#      supports Python 3.9-3.12 only. On 3.13+ there is no wheel and the
+#      source build is fragile. So "numpy<2" and "Python 3.13+" cannot both
+#      be satisfied cleanly -- the interpreter is the thing to change.
+#
+# Symptom that you are on a too-new Python: pip reports "Successfully built
+# numpy" (it should install a wheel, never build one) and then fails on
+# bed-reader.
+#
 # ─── Core (required for all modes) ───────────────────────────────────────────
 numpy<2                # Pinned, not just a lower bound. numpy 2.x breaks in
                        # TWO separate ways for this project: (1) a hard,
@@ -29,6 +59,27 @@ polars>=0.20           # fast tped reading and kinship computation.
                        # adds a compatible runtime that Polars selects
                        # automatically at import time based on your CPU;
                        # no need to uninstall the default polars first.
+pyarrow<17             # REQUIRED, not optional -- and the upper bound matters.
+                       # polars itself does not need
+                       # it, but DataFrame.to_pandas() does -- and that call
+                       # sits in _populate_genotypes_from_tped(), which EVERY
+                       # input format goes through (--bfile, --geno and --vcf
+                       # all write the same 6-column tped and read it back).
+                       # Without it a plain --bfile run dies with
+                       # "ModuleNotFoundError: No module named 'pyarrow'"
+                       # before any analysis starts. It was missing from this
+                       # file because pyarrow is usually pulled in as a
+                       # transitive dependency of something else, so a dev
+                       # machine has it already and a clean install does not.
+                       #
+                       # The <17 bound is NOT cosmetic: pyarrow 17+ requires
+                       # NumPy >= 2.0, which directly contradicts this
+                       # project's numpy<2 pin. Installing an unbounded
+                       # pyarrow alongside numpy<2 produces a DIFFERENT
+                       # broken install that fails at import with
+                       # "pyarrow requires NumPy 2.0 or newer, found 1.26.4".
+                       # Verified working combination: pyarrow 16.1.0 with
+                       # numpy 1.26.4.
 scikit-learn>=1.0      # PRS, GIFT PCA/NMF, consensus LAI
 matplotlib>=3.5        # all publication-quality plots
 
@@ -82,3 +133,12 @@ certifi                # ONLY needed for --annot (auto-downloading a reference
 # torch, h5py          # removed from jasmap/parse.py; no longer a dependency
 # cffi, pandas-plink   # replaced by bed-reader above
 # scikit-allel         # replaced by the built-in pure-Python VCF parser above
+
+# ─── Optional: LangGraph orchestration (jasmap_orchestrator.py) ──────────────
+# ONLY needed to run jasmap_orchestrator.py, which wraps the pipeline with
+# checkpoint/resume, per-step retry, and a provenance trail. JasMAP4.py
+# itself has no dependency on these -- the orchestrator invokes it as a
+# subprocess, so the core pipeline runs unchanged without them installed.
+# langgraph
+# langgraph-checkpoint-sqlite     # SQLite checkpoints (default, no setup)
+# langgraph-checkpoint-postgres   # Postgres checkpoints (distributed use)

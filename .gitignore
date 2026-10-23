@@ -84,3 +84,35 @@ desktop.ini
 *.bgen
 *.h5
 *.hdf5
+
+# ---- Participant data -- never commit ----
+# Phenotype and covariate files hold per-individual data (e.g. case/control
+# status) for identifiable cohort members. data/ is the conventional location.
+data/
+*.pheno
+*.cov
+*.covar
+
+# ---- JasMAP outputs, matched by FILE NAME wherever --out points ----
+# Output folders are user-named (e.g. --out ./MICHAEL), so they cannot be
+# listed here by folder. These patterns match what JasMAP writes instead.
+# Several hold per-individual results (PRS scores, per-sample ancestry).
+*.assoc
+*.tped
+*.png
+*_consensus_lai_*
+*_prs_results/
+*_consensus_gwas/
+*_gift_results/
+*_gift_admix_results/
+*_rvat_results/
+*_merged/
+*_auto_gene_annotation.bed
+*_array.slurm
+*_array.pbs
+logs/
+
+# Safety net, kept LAST so no rule above can exclude the source package
+# (later .gitignore rules override earlier ones).
+!/jasmap/
+!/jasmap/**

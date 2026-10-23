@@ -2,6 +2,23 @@
 # -*- coding: utf8 -*-
 
 from __future__ import print_function
+import sys as _sys_check
+if _sys_check.version_info[:2] > (3, 12):
+    # Early, explicit warning rather than a confusing failure later. JasMAP4
+    # requires numpy<2 (see requirements.txt), and numpy 1.26.x supports
+    # Python 3.9-3.12 only; bed-reader likewise has no wheel beyond recent
+    # versions and its Rust/PyO3 source build refuses to compile on 3.14.
+    # A real setup hit exactly this: pip compiled numpy from source, then
+    # failed outright on bed-reader. If the imports below happen to succeed
+    # on a newer interpreter, the install is still untested, so say so.
+    print(f"[WARNING] Running on Python "
+          f"{_sys_check.version_info.major}.{_sys_check.version_info.minor}; "
+          f"JasMAP4 is supported on Python 3.10-3.12 (3.12 recommended). "
+          f"Newer interpreters have no prebuilt wheels for numpy<2 or "
+          f"bed-reader and fall back to fragile source builds. If anything "
+          f"below behaves oddly, create a clean environment first:\n"
+          f"    conda create -n jasmap python=3.12 -y && conda activate jasmap\n",
+          file=_sys_check.stderr)
 import os
 import time, sys, argparse
 from functools import reduce
@@ -281,7 +298,7 @@ logger.addHandler(console)
 warnings.filterwarnings("ignore")
 
 # ro quiet splash $vt_handoff
-__version__ = "v4.0"
+__version__ = "v4.1"
 __author__ = "Jacquiline Mugo, N. Mulder, Emile .R Chimusa"
 __email__ = "jacquilinemugo@aims.ac.za and emile.chimusa@northumbria.ac.uk"
 __status__ = "Production"
@@ -400,51 +417,12 @@ class jasMapUtils ():
         logger.info(msg)
         logger.info('Total time elapsed : {T}'.format(T=self.sec_to_str(time_elapsed)))
 
-class _LazyLancDict(Mapping):
-    """
-    Read-only, dict-compatible view over a dense lanc_array, replacing the
-    fully-materialised {snp: {ancestry: [per_sample_values]}} dict.
-
-    Why this exists (performance fix, found on a real run):
-    building that dict eagerly for a genome-wide panel means allocating
-    n_snps * n_ancestries * n_individuals boxed Python integers -- for a
-    real 272,791-SNP x 1,363-sample x 5-ancestry cohort that is over 1.8
-    BILLION Python objects, which took 738 seconds (12.3 minutes, ~22% of
-    that run's total 57-minute wall time) purely to construct. The exact
-    same data already exists as self.lanc_array, a dense numpy int8 array
-    (~1.9 GB vs. ~52 GB if the ints weren't small-int-cached).
-
-    Critically, the pipeline's hot path never reads those values -- the
-    main analysis loop uses lanc_dict only for its KEYS (len() and
-    sorted(...keys())), and the one place that does read values is a
-    fallback that only runs when lanc_array is unavailable in the first
-    place. So the entire 738-second materialisation was building data
-    nothing subsequently consumed.
-
-    This class keeps the exact same read interface (d[snp][anc] -> list of
-    per-sample values, len(d), iteration, .keys(), .get()) so every
-    existing consumer works unchanged, but computes each per-SNP row from
-    lanc_array only when actually asked for. Keys are 1-based line numbers,
-    matching the original structure.
-    """
-    __slots__ = ("_arr", "_labels", "_n_snps")
-
-    def __init__(self, lanc_array, lanc_labels_list):
-        self._arr = lanc_array                # (K, n_snps, n_individuals)
-        self._labels = list(lanc_labels_list)
-        self._n_snps = lanc_array.shape[1]
-
-    def __getitem__(self, lineno):
-        if not (1 <= lineno <= self._n_snps):
-            raise KeyError(lineno)
-        idx = lineno - 1
-        return {anc: self._arr[anc - 1, idx].tolist() for anc in self._labels}
-
-    def __iter__(self):
-        return iter(range(1, self._n_snps + 1))
-
-    def __len__(self):
-        return self._n_snps
+# _LazyLancDict now lives in jasmap.lai.consensus_lai so that BOTH the
+# --yes-anc path (ConsensusLAI.fit Step 7) and the --ancfile path
+# (_populate_genotypes_from_tped below) share one implementation. It was
+# previously defined here only, which meant the LAI pipeline kept building
+# its lanc_dict eagerly -- see LazyLancDict's docstring for the measured cost.
+from jasmap.lai.consensus_lai import LazyLancDict as _LazyLancDict
 
 
 class jasMapInit(jasMapUtils):
@@ -532,6 +510,19 @@ class jasMapInit(jasMapUtils):
                  'Default (off): --chr restricts both LAI and the '
                  'downstream analysis to the same chromosome, as before. '
                  'Has no effect without both --yes-anc and --chr.')
+        parser.add_argument('--lai-region', default=None, type=str,
+            help='Genomic region to draw the local-ancestry region plot for, '
+                 'as CHR:START-END in megabases (e.g. "8:20-30" for chr8, '
+                 '20-30Mb). Without this, the plot defaults to an ARBITRARY '
+                 'illustrative slice -- the first 5Mb of whichever '
+                 'chromosome appears first in the .bim -- which is chosen by '
+                 'file order, not by any scientific criterion, and is very '
+                 'unlikely to be a region you care about. Set this to a '
+                 'locus of interest (e.g. an admixture-mapping or '
+                 'association hit) to get an informative plot. Use '
+                 '"none" to skip the region plot entirely. Note the plot is '
+                 'per-sample-per-SNP, so very wide regions are slow and '
+                 'visually unreadable; a few Mb is usually the useful range.')
         parser.add_argument('--mode', default=None, type=str,
             choices=['admix', 'GWAS', 'gift', 'gift_admix', 'rvat', 'LAI'],
             help='Analysis mode: '
@@ -544,7 +535,15 @@ class jasMapInit(jasMapUtils):
                  'LAI=standalone local + global ancestry inference only '
                  '(requires --yes-anc; no downstream association test).')
         parser.add_argument('--chr', default=None, type=str,
-            help='Chromosome to analyse (e.g. "22" or "chr22").')
+            help='Chromosome to analyse (e.g. "22" or "chr22"). Outputs are '
+                 'tagged automatically (<out-prefix>_chr22_*), so many '
+                 'chromosome jobs can share one --out folder and run in '
+                 'parallel. NOTE: without --covfile, PCs and the kinship are '
+                 'computed from this chromosome ALONE. For parallel '
+                 'genome-wide analysis use jasmap_parallel.py: `prepare` '
+                 '(genome-wide PCs once -> --covfile), `slurm` (job-array '
+                 'script), `merge` (genome-wide results, lambda_GC and '
+                 'plots). Do not combine with --PRS; run PRS genome-wide.')
         parser.add_argument('--kinship', default=0, type=int,
             help='Kinship matrix method: 0=Yang GRM, 1=unnorm, 2=two-group, 3=Chen.')
         parser.add_argument('--kinship-maf-min', default=0.01, type=float,
@@ -621,6 +620,43 @@ class jasMapInit(jasMapUtils):
                  'SNP count actually exceeds this value (no effect, no '
                  'wasted computation, on smaller panels). Set to 0 to '
                  'disable pre-filtering entirely and fit on every SNP.')
+        parser.add_argument('--gwas-model', default='lmm', choices=['lmm', 'glmm'],
+            help='Model for SNP association in --mode GWAS. "lmm" (default, '
+                 'unchanged): Gaussian linear mixed model. "glmm": logistic '
+                 'mixed model for a BINARY phenotype -- logit P(case) = '
+                 'covariates + genotype PCs + SNP dosage + u, with u drawn '
+                 'from a genomic relationship matrix built on the TESTED '
+                 'cohort; score test. Prefer glmm for case-control phenotypes '
+                 'with unbalanced case and control numbers. Add --spa for '
+                 'accurate p-values at low-frequency variants. Falls back to '
+                 'lmm with a warning if the phenotype is not binary.')
+        parser.add_argument('--spa', default=False, action='store_true',
+            help='Apply the saddlepoint approximation (SPA) to GLMM score '
+                 'tests -- used with --am-model glmm and/or --gwas-model glmm; '
+                 'no effect on the LMM. Corrects tail p-values under '
+                 'case-control imbalance, where the normal approximation is '
+                 'anti-conservative for low-frequency predictors (rare '
+                 'variants; minor ancestries). In null simulations at 87.6%% '
+                 'cases with MAF 0.03, the normal approximation gave 5 '
+                 'false positives at alpha 1e-4 where 2 were expected; SPA '
+                 'gave 1. For common predictors SPA makes no difference. '
+                 'Applied only where |z| > 2, so the added cost is small. '
+                 'Recommended whenever one outcome class is small.')
+        parser.add_argument('--am-model', default='lmm', choices=['lmm', 'glmm'],
+            help='Model for the per-ancestry admixture-mapping test in '
+                 '--mode admix. "lmm" (default, unchanged): Gaussian linear '
+                 'mixed model. "glmm": logistic mixed model for a BINARY '
+                 'phenotype -- logit P(case) = covariates + genotype PCs + '
+                 'global ancestry q_k + local-ancestry dosage + u, with u '
+                 'drawn from an ancestry-specific kinship built on the tested '
+                 'cohort; score test (add --spa for the saddlepoint '
+                 'approximation). Prefer '
+                 'glmm for case-control phenotypes with unbalanced case and '
+                 'control numbers: in null simulations at 87.6%% cases the LMM '
+                 'gave lambda_GC 0.54 while the GLMM gave 1.02. Slower -- one '
+                 'null model fit per ancestry, roughly a minute each at n~700. '
+                 'Falls back to lmm with a warning if the phenotype is not '
+                 'binary.')
         parser.add_argument('--consgwas', default=False, action='store_true',
             help='Run the 8-step Consensus GWAS/RVAT pipeline after --mode completes. '
                  'Integrates results from the primary --mode with additional internal '
@@ -2183,7 +2219,36 @@ class Joint_Association(jasMapInit, LMM):
         docstring area (column 0, the actual ID, instead of column 1, gender).
         '''
         starting_time = time.time()
-        self._use_streaming_lmm = False  # no chunked-read mechanism for this format
+        # Priority 3 (streaming parity): this used to be hard-set False with
+        # the note "no chunked-read mechanism for this format", which meant
+        # the size-aware kinship dispatcher -- and therefore all biobank-scale
+        # support -- applied ONLY to --bfile. The dispatcher was never the
+        # gap; these formats simply had no chunked reader to feed it. Both
+        # already produce the shared intermediate .tped file, and
+        # StreamingGenotypeSource now accepts a .tped path via
+        # MemmapGenotypeBackend (one-time binary conversion, then memmapped
+        # chunk reads). Verified against the .bed backend on identical data:
+        # kinship matrices agree to 4.4e-16 and traces match exactly.
+        # Decision uses the SAME recommend_lmm_strategy() call as --bfile, so
+        # small inputs keep the exact dense path unchanged.
+        try:
+            from jasmap.biobank.auto_lmm import recommend_lmm_strategy
+            _n_str = len(self.phenotypes) if hasattr(self, "phenotypes") else 0
+            _tier = recommend_lmm_strategy(
+                _n_str,
+                memory_limit_bytes=self.args.kinship_memory_limit_gb * 1024**3)
+            self._use_streaming_lmm = (_tier == "approximate")
+            self._streaming_source_path = self._tped_path()
+            if self._use_streaming_lmm:
+                logger.info(
+                    f"[streaming_io] n={_n_str} exceeds the dense-kinship "
+                    f"threshold; using the chunked .tped path for this "
+                    f"format (same dispatcher as --bfile).")
+        except Exception as _e:
+            logger.warning(f"[streaming_io] Could not enable chunked reads "
+                          f"for this format ({_e}); falling back to the "
+                          f"dense path.")
+            self._use_streaming_lmm = False
 
         snp_meta = pd.read_csv(self.geno_file + ".snp", sep=r"\s+", header=None,
                                names=["SNP", "CHR", "CM", "POS", "A1", "A2"], engine="python")
@@ -2392,7 +2457,36 @@ class Joint_Association(jasMapInit, LMM):
         """
         logger.info('Reading vcf file from {fname}\n'.format(fname=self.args.vcf))
         starting_time = time.time()
-        self._use_streaming_lmm = False  # no chunked-read mechanism for VCF input
+        # Priority 3 (streaming parity): this used to be hard-set False with
+        # the note "no chunked-read mechanism for this format", which meant
+        # the size-aware kinship dispatcher -- and therefore all biobank-scale
+        # support -- applied ONLY to --bfile. The dispatcher was never the
+        # gap; these formats simply had no chunked reader to feed it. Both
+        # already produce the shared intermediate .tped file, and
+        # StreamingGenotypeSource now accepts a .tped path via
+        # MemmapGenotypeBackend (one-time binary conversion, then memmapped
+        # chunk reads). Verified against the .bed backend on identical data:
+        # kinship matrices agree to 4.4e-16 and traces match exactly.
+        # Decision uses the SAME recommend_lmm_strategy() call as --bfile, so
+        # small inputs keep the exact dense path unchanged.
+        try:
+            from jasmap.biobank.auto_lmm import recommend_lmm_strategy
+            _n_str = len(self.phenotypes) if hasattr(self, "phenotypes") else 0
+            _tier = recommend_lmm_strategy(
+                _n_str,
+                memory_limit_bytes=self.args.kinship_memory_limit_gb * 1024**3)
+            self._use_streaming_lmm = (_tier == "approximate")
+            self._streaming_source_path = self._tped_path()
+            if self._use_streaming_lmm:
+                logger.info(
+                    f"[streaming_io] n={_n_str} exceeds the dense-kinship "
+                    f"threshold; using the chunked .tped path for this "
+                    f"format (same dispatcher as --bfile).")
+        except Exception as _e:
+            logger.warning(f"[streaming_io] Could not enable chunked reads "
+                          f"for this format ({_e}); falling back to the "
+                          f"dense path.")
+            self._use_streaming_lmm = False
         self.phenotypes, self.samples_list = ps.read_pheno_file(self.args.pheno)
         vcf_actual_samples, self.chr_snp_idx, _vcf_n_variants = ps.load_vcf_samples_in_map(
             self.args.vcf, self.samples_list, self._tped_path(),
@@ -2697,31 +2791,113 @@ class Joint_Association(jasMapInit, LMM):
             # validate_association_batch.py to match the per-SNP results to
             # within floating-point precision, at 20-500x the speed).
             snp_order = list(self.genotypes.keys())
-            X_batch = np.column_stack([self.genotypes[s] for s in snp_order])
-            X_batch = X_batch[nonmissing_mask, :]
-            betas, stderrs, ts_vals, ps_vals = L.association_batch(X_batch, h=hmax, REML=True)
 
-            # Vectorized metadata lookup (single indexing op, not a per-row
-            # .iloc() call) plus a single bulk write at the end -- matching
-            # the "build lines, one bulk write" pattern already used for
-            # admix mode's own output further below, rather than adding
-            # per-row pandas overhead to what was already an unvectorized
-            # per-SNP loop at up to hundreds of thousands of SNPs.
-            snp_order_arr = np.array(snp_order) - 1  # self.snp_meta is 0-indexed
-            chr_vals = self.snp_meta['chrom'].values[snp_order_arr]
-            snp_vals = self.snp_meta['snp'].values[snp_order_arr]
-            pos_vals = self.snp_meta['pos'].values[snp_order_arr]
+            # Priority 4 (GWAS SNP-chunking): this used to build the ENTIRE
+            # (n_samples x n_snps) design matrix in one np.column_stack call
+            # before testing anything. At 1M SNPs x 10K samples that is ~80 GB
+            # in float64 -- and column_stack transiently holds BOTH the list of
+            # per-SNP arrays and the assembled result, so peak is worse still.
+            #
+            # Chunking is exactly equivalent here, not an approximation: by the
+            # Frisch-Waugh-Lovell decomposition association_batch() already
+            # uses, each SNP's beta/se/t/p depends only on the residualized
+            # phenotype and that SNP's OWN residualized column. The shared
+            # inputs (X0, h) are fixed by L.fit() before this point, so SNPs
+            # in different chunks cannot influence each other. Verified
+            # empirically as bit-identical to the single full-batch call.
+            #
+            # Output is written per chunk too, so the `lines` list no longer
+            # grows to one string per SNP across the whole genome either.
+            n_snps_total = len(snp_order)
+            target_chunk_bytes = 256 * 1024 ** 2
+            n_kept = int(np.count_nonzero(nonmissing_mask))
+            snp_chunk = max(1, int(target_chunk_bytes / max(n_kept * 8, 1)))
+            snp_chunk = min(snp_chunk, n_snps_total)
 
-            lines = []
-            for idx in range(len(snp_order)):
-                if np.isnan(ps_vals[idx]):
-                    lines.append(f"{chr_vals[idx]}\t{snp_vals[idx]}\t{pos_vals[idx]}\tnan\tnan")
+            snp_order_arr_all = np.array(snp_order) - 1  # self.snp_meta is 0-indexed
+            chr_all = self.snp_meta['chrom'].values[snp_order_arr_all]
+            snp_all = self.snp_meta['snp'].values[snp_order_arr_all]
+            pos_all = self.snp_meta['pos'].values[snp_order_arr_all]
+
+            if snp_chunk < n_snps_total:
+                logger.info(
+                    f"[GWAS] Testing {n_snps_total:,} SNPs in chunks of "
+                    f"{snp_chunk:,} (~{n_kept * snp_chunk * 8 / 1e9:.2f} GB "
+                    f"per chunk) rather than materialising the full "
+                    f"{n_kept * n_snps_total * 8 / 1e9:.1f} GB design matrix "
+                    f"at once. Results are identical either way.")
+
+            # Optional logistic mixed model (--gwas-model glmm). The null model
+            # is fitted ONCE on the tested cohort, then each chunk is
+            # score-tested -- same chunking as the LMM path below.
+            _gnull = None
+            if getattr(self.args, "gwas_model", "lmm") == "glmm":
+                from jasmap.admix_glmm import (fit_null_glmm, score_test,
+                                               genotype_grm, to_binary)
+                _yv = np.asarray(self.phenotypes, dtype=np.float64).ravel()
+                _yb = to_binary(_yv[nonmissing_mask]) if _yv.size == np.size(nonmissing_mask) else None
+                if _yb is None:
+                    logger.warning("[GWAS] --gwas-model glmm needs a BINARY "
+                                   "phenotype (0/1 or PLINK 1/2); this one is "
+                                   "not, so the default LMM is used instead.")
                 else:
-                    lines.append(f"{chr_vals[idx]}\t{snp_vals[idx]}\t{pos_vals[idx]}\t{betas[idx]}\t{ps_vals[idx]}")
-            joint_fout.write("\n".join(lines) + "\n")
+                    _Xc = np.asarray(X0s, dtype=np.float64)
+                    if _Xc.shape[0] == np.size(nonmissing_mask):
+                        _Xc = _Xc[nonmissing_mask]
+                    if not np.allclose(_Xc[:, 0], 1.0):
+                        _Xc = np.column_stack([np.ones(_Xc.shape[0]), _Xc])
+                    # GRM from evenly spaced SNPs on the TESTED cohort only
+                    _step = max(1, n_snps_total // 50000)
+                    _Gk = np.column_stack([self.genotypes[s] for s in snp_order[::_step]])[nonmissing_mask]
+                    _K = genotype_grm(_Gk, maf_min=getattr(self.args, "kinship_maf_min", 0.01))
+                    del _Gk
+                    _gnull = fit_null_glmm(_yb, _Xc, _K)
+                    _gnull["y"] = _yb
+                    _n_t = len(_yb)
+                    logger.info(
+                        f"[GWAS-GLMM] Null logistic mixed model on {_n_t} tested "
+                        f"sample(s) ({int(_yb.sum())} cases / {int(_n_t-_yb.sum())} "
+                        f"controls), {_Xc.shape[1]} covariates: tau="
+                        f"{_gnull['tau']:.3f}, converged={_gnull['converged']}. "
+                        f"Score tests use "
+                        f"{'the saddlepoint approximation (--spa)' if getattr(self.args,'spa',False) else 'the normal approximation'}.")
+                    if not _gnull["converged"]:
+                        logger.warning(
+                            "[GWAS-GLMM] The null model did NOT converge -- too "
+                            "few samples per covariate, or quasi-separation of "
+                            "cases from controls. P-values are unreliable; "
+                            "reduce --auto-pca-k or use --gwas-model lmm.")
+                    _minor = min(_yb.sum(), _n_t - _yb.sum()) / _n_t
+                    if _minor < 0.2 and not getattr(self.args, "spa", False):
+                        logger.info(
+                            f"[GWAS-GLMM] The smaller outcome class is "
+                            f"{100*_minor:.1f}% of the cohort; consider --spa "
+                            f"for accurate p-values at low-frequency variants.")
+
+            for c_start in range(0, n_snps_total, snp_chunk):
+                c_end = min(c_start + snp_chunk, n_snps_total)
+                X_batch = np.column_stack(
+                    [self.genotypes[s] for s in snp_order[c_start:c_end]])
+                X_batch = X_batch[nonmissing_mask, :]
+                if _gnull is not None:
+                    betas, _zz, ps_vals = score_test(
+                        X_batch, _gnull, spa=bool(getattr(self.args, "spa", False)))
+                else:
+                    betas, stderrs, ts_vals, ps_vals = L.association_batch(
+                        X_batch, h=hmax, REML=True)
+                del X_batch
+
+                lines = []
+                for j in range(c_end - c_start):
+                    i = c_start + j
+                    if np.isnan(ps_vals[j]):
+                        lines.append(f"{chr_all[i]}\t{snp_all[i]}\t{pos_all[i]}\tnan\tnan")
+                    else:
+                        lines.append(f"{chr_all[i]}\t{snp_all[i]}\t{pos_all[i]}\t{betas[j]}\t{ps_vals[j]}")
+                joint_fout.write("\n".join(lines) + "\n")
 
             joint_fout.close()
-            logger.info('GWAS-mode batched association complete for %d SNPs.' % len(snp_order))
+            logger.info('GWAS-mode batched association complete for %d SNPs.' % n_snps_total)
             return
 
         # Performance fix: admix mode's Part I (per-ancestry admixture mapping)
@@ -2759,26 +2935,185 @@ class Joint_Association(jasMapInit, LMM):
         beta_matrix = np.full((n_snps, self.no_of_ancs), np.nan)
         stderr_matrix = np.full((n_snps, self.no_of_ancs), np.nan)
 
+        # Bug fix: restrict the ancestry matrix to the TESTED samples BEFORE
+        # deriving any statistic from it.
+        #
+        # Admixture mapping asks whether local ancestry dosage covaries with
+        # phenotype WITHIN the admixed cohort. Reference-panel individuals
+        # are, by construction, ~100% their own ancestry and have no
+        # phenotype, so they cannot contribute to that regression -- but the
+        # code computed lai_ave, lai_var and the `valid` filter across ALL
+        # samples and only subset afterwards. Those reference samples
+        # therefore set the mean and the validity decision for a test they
+        # take no part in.
+        #
+        # The effect on real data was severe. Of 272,791 SNPs per ancestry:
+        # CEU 325 usable tests, KHS 325, GIH 150, YRI 50, and CHB ZERO --
+        # 99.9% NaN, with as few as ONE distinct beta across a whole
+        # chromosome set. An ancestry carried mostly by its own reference
+        # panel gets a mean dominated by those fixed-dosage samples, so
+        # `lai_ave >= 0.01` and the centring both describe the wrong
+        # population and the per-SNP contrast within the admixed cohort is
+        # flattened away.
+        #
+        # Computing on the tested samples only makes lai_ave the actual mean
+        # ancestry proportion in the cohort being tested, and `valid` a
+        # statement about whether that ancestry varies where it matters.
+        _am_mask = nonmissing_mask
+        _n_am = int(np.count_nonzero(_am_mask))
+        if _n_am < int(np.size(_am_mask)):
+            logger.info(
+                f"[AM] Ancestry-dosage statistics (mean, variance, validity) "
+                f"computed on the {_n_am} tested sample(s) only, not all "
+                f"{int(np.size(_am_mask))} -- reference-panel individuals are "
+                f"fixed at ~100% their own ancestry and have no phenotype, so "
+                f"including them would set the mean and the validity filter "
+                f"for a test they cannot take part in.")
+
+        # Use EXPECTED local-ancestry dosage (posterior probabilities summed
+        # over the windows covering each SNP) when the soft posteriors are
+        # available, rather than the hard argmax call counts in lanc_array.
+        #
+        # Why: a hard call keeps only each person's MOST LIKELY ancestry in a
+        # window, so it varies between people only when their top ancestry
+        # differs. A minority ancestry that is rarely anyone's top call --
+        # e.g. European or East Asian in a predominantly African-ancestry
+        # cohort -- is then near-constant across the cohort, and the
+        # regression on it is undefined (NaN). The soft dosage keeps the
+        # probability mass, so it varies whenever people's posteriors differ
+        # at all. Found on real data where most admixture-mapping tests were
+        # NaN and the usable ones fell in contiguous blocks exactly one LAI
+        # window wide -- i.e. windows where everyone shared the same hard call.
+        # Expected dosage is also the standard input for admixture mapping,
+        # and on simulated genomes with known local ancestry it tracked the
+        # truth more closely than hard calls in every condition tested
+        # (r 0.80 vs 0.62 with well-separated populations).
+        #
+        # Shape and indexing are kept identical to lanc_array (same SNP axis,
+        # same window accumulation, same sample order), so everything below is
+        # unchanged. Falls back to hard calls when posteriors are unavailable,
+        # e.g. when local ancestry was supplied via --ancfile.
+        _lai = getattr(self, "_lai_obj", None)
+        _L = getattr(_lai, "L_", None) if _lai is not None else None
+        _wins = getattr(_lai, "wins_", None) if _lai is not None else None
+        _use_soft = (_L is not None and _wins is not None
+                     and _L.shape[0] == self.lanc_array.shape[2]
+                     and _L.shape[2] == self.no_of_ancs)
+        _n_snps_am = self.lanc_array.shape[1]
+        if _use_soft:
+            logger.info("[AM] Using expected local-ancestry DOSAGE (soft "
+                        "posteriors) for admixture mapping, not hard calls.")
+        else:
+            logger.info("[AM] Soft local-ancestry posteriors unavailable "
+                        "(e.g. --ancfile input); using hard ancestry calls.")
+        _diag = []
+
         for anc in range(1, self.no_of_ancs + 1):
-            anc_matrix = self.lanc_array[anc - 1].astype(np.float64)  # (n_snps, n_samples)
-            lai_ave = anc_matrix.sum(axis=1) / (2.0 * n_samples)
-            lai_var = 2 * lai_ave * (1 - lai_ave)
-            valid = (lai_ave >= 0.01) & (lai_var != 0.0)
+            _hard = (self.lanc_array[anc - 1][:, _am_mask].astype(np.float64))
+            if _use_soft:
+                _Lk = np.asarray(_L[_am_mask, :, anc - 1], dtype=np.float64)
+                anc_matrix = np.zeros((_n_snps_am, _Lk.shape[0]))
+                for _wi, _idx in enumerate(_wins):
+                    anc_matrix[_idx, :] += _Lk[:, _wi][None, :]
+            else:
+                anc_matrix = _hard
+            # Diagnostic: how many SNPs carry usable cross-sample variation
+            # under each representation. Reported so a run on real data shows
+            # directly whether hard calls were the bottleneck.
+            def _usable(D):
+                ave = D.sum(axis=1) / (2.0 * max(D.shape[1], 1))
+                return float(((ave >= 0.01) & (D.std(axis=1) > 0)).mean())
+            _diag.append((anc, _usable(_hard),
+                          _usable(anc_matrix) if _use_soft else None,
+                          float(anc_matrix.mean() / 2.0)))
+            _n_eff = anc_matrix.shape[1]
+            lai_ave = anc_matrix.sum(axis=1) / (2.0 * max(_n_eff, 1))
+            # Use the EMPIRICAL variance of the dosage across the tested
+            # samples rather than the binomial form 2p(1-p). The binomial
+            # form is only zero when p is exactly 0 or 1, so it cannot detect
+            # a SNP where every tested sample happens to share the same
+            # dosage -- precisely the case that makes the regression
+            # undefined and yields NaN downstream.
+            lai_sd = anc_matrix.std(axis=1)
+            valid = (lai_ave >= 0.01) & (lai_sd > 0.0)
 
             with np.errstate(divide='ignore', invalid='ignore'):
-                norm_anc = (anc_matrix - lai_ave[:, None]) / lai_var[:, None]
+                norm_anc = (anc_matrix - anc_matrix.mean(axis=1)[:, None]) / lai_sd[:, None]
             norm_anc_safe = np.where(valid[:, None], norm_anc, 0.0)
-            # Same nonmissing filtering as the GWAS-mode X_batch above --
-            # lai_L (constructed further up from the SAME self.phenotypes)
-            # has already internally dropped any missing-phenotype samples,
-            # so the ancestry-dosage covariate needs the same samples-axis
-            # filter before being handed to lai_L.association_batch().
-            norm_anc_safe = norm_anc_safe[:, nonmissing_mask]
+            # anc_matrix is already restricted to the tested samples above,
+            # so no further samples-axis filtering is needed here.
 
             lai_hmax = self.lai_h_dict[anc]
             lai_L = self.lai_L_instances[anc]
-            Abetas, Astderrs, Ats_arr, Aps_arr = lai_L.association_batch(
-                norm_anc_safe.T, h=lai_hmax, REML=True)
+            _glmm_done = False
+            if getattr(self.args, "am_model", "lmm") == "glmm":
+                from jasmap.admix_glmm import run_glmm_am, to_binary
+                _y_all = np.asarray(self.phenotypes, dtype=np.float64).ravel()
+                _y_bin = to_binary(_y_all[_am_mask]) if _y_all.size == np.size(_am_mask) else None
+                if _y_bin is None:
+                    if anc == 1:
+                        logger.warning(
+                            "[AM] --am-model glmm needs a BINARY phenotype "
+                            "(0/1 or PLINK 1/2); this one is not, so the "
+                            "default LMM is used instead.")
+                else:
+                    # Covariates: intercept + PCs/--covfile (already in X0s)
+                    # + global ancestry q_k for THIS ancestry. Both are kept:
+                    # q_k targets ancestry-k confounding specifically, PCs
+                    # capture residual structure (see jasmap/admix_glmm.py).
+                    _X0 = np.asarray(X0s, dtype=np.float64)
+                    _X0 = _X0[_am_mask] if _X0.shape[0] == np.size(_am_mask) else _X0
+                    _cols = [_X0]
+                    _q = getattr(self, "global_ancestry_q", None)
+                    if _q is not None and np.shape(_q)[0] == np.size(_am_mask):
+                        _cols.append(np.asarray(_q)[_am_mask][:, [anc - 1]])
+                    _X = np.column_stack(_cols)
+                    if not np.allclose(_X[:, 0], 1.0):
+                        _X = np.column_stack([np.ones(_X.shape[0]), _X])
+                    # Test each DISTINCT dosage pattern once (dosage is
+                    # constant across SNPs covered by the same LAI windows),
+                    # then map results back to every SNP sharing it.
+                    _valid_rows = np.flatnonzero(valid)
+                    Abetas = np.full(anc_matrix.shape[0], np.nan)
+                    Aps_arr = np.full(anc_matrix.shape[0], np.nan)
+                    Astderrs = np.full(anc_matrix.shape[0], np.nan)
+                    Ats_arr = np.full(anc_matrix.shape[0], np.nan)
+                    if len(_valid_rows):
+                        _pat, _inv = np.unique(anc_matrix[_valid_rows], axis=0,
+                                               return_inverse=True)
+                        _b, _p, _null = run_glmm_am(
+                            _pat.T, _y_bin, _X,
+                            spa=bool(getattr(self.args, "spa", False)))
+                        Abetas[_valid_rows] = _b[_inv.ravel()]
+                        Aps_arr[_valid_rows] = _p[_inv.ravel()]
+                        logger.info(
+                            f"[AM-GLMM] ancestry {anc}: {len(_pat):,} distinct "
+                            f"dosage patterns tested for {len(_valid_rows):,} "
+                            f"SNPs; null tau={_null['tau']:.3f}, converged="
+                            f"{_null['converged']}, covariates={_X.shape[1]}")
+                        _mn = min(_y_bin.sum(), len(_y_bin) - _y_bin.sum()) / len(_y_bin)
+                        if (anc == 1 and _mn < 0.2
+                                and not getattr(self.args, "spa", False)):
+                            logger.info(
+                                f"[AM-GLMM] The smaller outcome class is "
+                                f"{100*_mn:.1f}% of the tested cohort; consider "
+                                f"--spa for accurate p-values at minor ancestries.")
+                        if not _null["converged"]:
+                            _n_t = _X.shape[0]
+                            logger.warning(
+                                f"[AM-GLMM] ancestry {anc}: the null logistic "
+                                f"mixed model did NOT converge ({_X.shape[1]} "
+                                f"covariates for {_n_t} tested samples, "
+                                f"{int(_y_bin.sum())} cases / "
+                                f"{int(_n_t - _y_bin.sum())} controls). Usual "
+                                f"cause: too few samples per covariate, or "
+                                f"quasi-separation of cases from controls. "
+                                f"P-values for this ancestry are unreliable -- "
+                                f"reduce --auto-pca-k, or use --am-model lmm.")
+                    _glmm_done = True
+            if not _glmm_done:
+                Abetas, Astderrs, Ats_arr, Aps_arr = lai_L.association_batch(
+                    norm_anc_safe.T, h=lai_hmax, REML=True)
 
             Abetas = np.where(valid, Abetas, np.nan)
             Aps_arr = np.where(valid, Aps_arr, np.nan)
@@ -2792,6 +3127,30 @@ class Joint_Association(jasMapInit, LMM):
             for i in range(n_snps):
                 anc_lines.append(f"{chr_vals[i]}\t{snp_vals[i]}\t{pos_vals[i]}\t{Abetas[i]}\t{Aps_arr[i]}")
             anc_prior_fout_dict[anc].write("\n".join(anc_lines) + "\n")
+
+        # Per-ancestry diagnostic. Shows, for the tested cohort, the mean
+        # local-ancestry proportion and the share of SNPs with usable
+        # cross-sample variation under hard calls vs expected dosage. On a
+        # real run this distinguishes the two possible causes of NaN-heavy
+        # output: if SOFT is also near 0%, the local-ancestry posteriors
+        # themselves barely differ between people (an inference problem); if
+        # SOFT is high while HARD is low, hard calls were the bottleneck.
+        _labs = getattr(self, "_pop_labels", None) or []
+        for _a, _uh, _us, _mean in _diag:
+            _nm = _labs[_a - 1] if _a - 1 < len(_labs) else f"ANC{_a}"
+            _soft_txt = f", soft {_us:.1%}" if _us is not None else ""
+            logger.info(f"[AM] {_nm}: mean local-ancestry proportion in tested "
+                        f"cohort {_mean:.3f}; SNPs with usable variation -- "
+                        f"hard {_uh:.1%}{_soft_txt}")
+            if _us is not None and _us < 0.05:
+                logger.warning(
+                    f"[AM] {_nm}: under 5% of SNPs carry usable variation even "
+                    f"with expected dosage. The local-ancestry posteriors for "
+                    f"this ancestry barely differ between people in the tested "
+                    f"cohort -- an inference limitation, not a statistical one. "
+                    f"Likely causes: the ancestry is genuinely rare here, its "
+                    f"reference panel is small, or it is not well separated "
+                    f"from another ancestry at this K.")
 
         # ---- Part II: choose, per SNP, the ancestry with the lowest AM p-value ----
         all_nan_rows = np.all(np.isnan(pval_matrix), axis=1)
@@ -3246,9 +3605,35 @@ class JasMAP(Joint_Association):
                     f.write(f"{c}\t{s}\t{e}\t{g}\n")
 
             self.args.gene_annot = out_path
-            logger.info(f"[--annot] Auto-built gene annotation: {len(kept)} "
-                       f"gene(s) relevant to this study's SNPs -> {out_path}. "
-                       f"Using this for --mode rvat's gene-based tests.")
+            # Bug fix: this message previously said "Using this for --mode
+            # rvat's gene-based tests" unconditionally, regardless of the
+            # mode actually running -- so a --mode GWAS run was told its
+            # annotation was feeding RVAT, which was not running at all.
+            # Worse, the claim was not merely mislabelled: self.args.gene_annot
+            # is consumed in exactly two places -- run_rvat()'s gene_file
+            # argument (--mode rvat) and _compute_snp_to_gene_dict(), which
+            # builds the Gene column for --mode admix/gift_admix. For every
+            # other mode the file is built and then never read, so the user
+            # pays the download/parse/filter/write cost and is actively told
+            # it is being used. Found in a real --mode GWAS log that reported
+            # 27,610 genes "for --mode rvat's gene-based tests".
+            _consumers = {"rvat": "gene-based rare-variant tests",
+                          "admix": "the Gene column on Joint.assoc and PRS output",
+                          "gift_admix": "the Gene column on PRS output"}
+            _use = _consumers.get(self.args.mode)
+            if _use:
+                logger.info(f"[--annot] Auto-built gene annotation: "
+                           f"{len(kept)} gene(s) relevant to this study's "
+                           f"SNPs -> {out_path}. Using this for {_use}.")
+            else:
+                logger.info(
+                    f"[--annot] Auto-built gene annotation: {len(kept)} "
+                    f"gene(s) relevant to this study's SNPs -> {out_path}. "
+                    f"NOTE: --mode {self.args.mode} does not consume a gene "
+                    f"annotation, so this file is written for your own use "
+                    f"but will not affect this run's results. Gene "
+                    f"annotation is used by --mode rvat (gene-based tests) "
+                    f"and --mode admix/gift_admix (the Gene output column).")
         except Exception as e:
             logger.info(f"[--annot] Auto-build failed ({type(e).__name__}: "
                        f"{e}) -- falling back to the default gene-proxy "
@@ -3424,12 +3809,65 @@ class JasMAP(Joint_Association):
             # Genotype-level PCA (admixed samples between reference clusters)
             _safe_plot("lai_genotype_pca", lai.plot_genotype_pca,
                       out_path=self.outfolder + "lai_genotype_pca.png")
-            # Karyogram for the first few samples
-            _safe_plot("karyograms", lai.plot_karyograms_all,
-                      out_dir=self.outfolder, max_samples=5)
+            # Karyogram for a few samples. Pass the study-cohort sample IDs so
+            # reference-panel individuals are excluded rather than guessed at
+            # from the data -- see plot_karyograms_all()'s own note on why an
+            # entropy-only criterion selected the wrong samples.
+            _kary_ids = None
             try:
-                # LAI region example: first chromosome found, full span
-                if lai._bim is not None:
+                _fam_ids = getattr(lai, "_sample_ids", None)
+                if _fam_ids is not None:
+                    # Read --pop-file DIRECTLY rather than going through
+                    # _get_study_cohort_mask(). That helper computes
+                    # ~np.isnan(y) up front, so it needs a phenotype vector
+                    # even when the pop-file alone fully answers the question
+                    # -- and at this point in the run the phenotypes may not
+                    # be loaded yet. Found on a real run: self.phenotypes
+                    # EXISTED but was None (LAI had reused an earlier run's
+                    # tmp.tped, so the genotype/phenotype read that populates
+                    # it was skipped), hasattr() therefore passed None
+                    # through, len(None) raised, and karyogram selection fell
+                    # back to all samples -- reinstating exactly the bug the
+                    # study-cohort restriction was added to fix, selecting 5
+                    # GIH reference individuals again.
+                    #
+                    # The pop-file is parsed and validated at startup and is
+                    # not dependent on run order, so using it directly makes
+                    # this independent of when phenotypes load. The phenotype
+                    # route is kept only as a fallback for runs with no
+                    # --pop-file.
+                    if self.args.pop_file:
+                        _pf = pd.read_csv(self.args.pop_file, sep=r"\s+",
+                                          header=None, names=["ID", "POP"],
+                                          dtype=str, engine="python")
+                        _id2pop = dict(zip(_pf["ID"].astype(str),
+                                           _pf["POP"].astype(str)))
+                        _kary_ids = [sid for sid in _fam_ids
+                                     if _id2pop.get(str(sid)) == self.args.admix_label]
+                        if not _kary_ids:
+                            logger.info(
+                                f"[LAI] No sample matched --admix-label "
+                                f"{self.args.admix_label!r} in --pop-file; "
+                                f"karyograms will use all samples.")
+                            _kary_ids = None
+                    elif getattr(self, "phenotypes", None) is not None:
+                        _mask = self._get_study_cohort_mask(
+                            self.phenotypes,
+                            genotype_sample_ids=np.asarray(_fam_ids))
+                        _kary_ids = [sid for sid, keep in zip(_fam_ids, _mask) if keep]
+            except Exception as _e:
+                logger.info(f"[LAI] Could not determine the study cohort for "
+                           f"karyogram selection ({_e}); using all samples.")
+            _safe_plot("karyograms", lai.plot_karyograms_all,
+                      out_dir=self.outfolder, max_samples=5,
+                      study_sample_ids=_kary_ids)
+            _skip_region = (
+                str(getattr(self.args, "lai_region", "") or "").lower() == "none")
+            if _skip_region:
+                logger.info("[LAI] Region plot skipped (--lai-region none).")
+            try:
+                # LAI region: --lai-region if given, else an arbitrary slice
+                if lai._bim is not None and not _skip_region:
                     try:
                         bim_cols = {c.upper(): c for c in lai._bim.columns}
                         chr_col  = bim_cols.get("CHR", bim_cols.get("CHROM", None))
@@ -3478,8 +3916,114 @@ class JasMAP(Joint_Association):
                             # first_chr only, not the whole genome), the
                             # SAME "bad allocation" error persisted.
                             _region_cap_mb = 5.0
-                            if end_mb - start_mb > _region_cap_mb:
-                                end_mb = start_mb + _region_cap_mb
+                            _user_region = getattr(self.args, "lai_region", None)
+                            _explicit = False
+                            # Snapshot the computed default BEFORE attempting to
+                            # parse a user region. The parse mutates first_chr/
+                            # start_mb/end_mb in place, so a failure partway
+                            # through would otherwise leave them corrupted and
+                            # the "fallback" would use the bad values. Found
+                            # exactly that way: --lai-region 99 (a chromosome
+                            # not in the panel) failed validation but still
+                            # wrote a file called lai_region_chr99.png for a
+                            # chromosome that does not exist.
+                            _def_chr, _def_start, _def_end = first_chr, start_mb, end_mb
+                            if _user_region and str(_user_region).lower() != "none":
+                                # Parse CHR:START-END (Mb). An explicit region
+                                # overrides the arbitrary default entirely,
+                                # including the 5Mb cap -- if a user asks for a
+                                # specific window they mean it, though a very
+                                # wide one is slow and hard to read (the plot is
+                                # per-sample-per-SNP).
+                                try:
+                                    _spec = str(_user_region).strip()
+                                    if ":" in _spec:
+                                        _c, _span = _spec.split(":")
+                                        _s, _e = _span.split("-")
+                                        first_chr = int(str(_c).replace("chr", ""))
+                                        start_mb, end_mb = float(_s), float(_e)
+                                        if end_mb <= start_mb:
+                                            raise ValueError("END must exceed START")
+                                    else:
+                                        # Bare chromosome (e.g. "--lai-region 11")
+                                        # means the WHOLE of that chromosome. A
+                                        # real run passed exactly this and was
+                                        # rejected -- a reasonable request the
+                                        # CHR:START-END-only parser did not
+                                        # support. Full-chromosome spans are
+                                        # feasible now: lai_region_plot() caps
+                                        # its canvas at 60in per axis and
+                                        # subsamples to max_samples=100, and
+                                        # tract drawing is batched via
+                                        # PatchCollection -- the combination
+                                        # that fixed the earlier "bad
+                                        # allocation" crash on wide regions.
+                                        first_chr = int(_spec.replace("chr", ""))
+                                        _cm = (lai._bim[chr_col].astype(str)
+                                               .str.replace("chr", "", regex=False)
+                                               == str(first_chr))
+                                        if not _cm.any():
+                                            raise ValueError(
+                                                f"chromosome {first_chr} not found "
+                                                f"in the .bim")
+                                        _pos = pd.to_numeric(
+                                            lai._bim.loc[_cm, bp_col],
+                                            errors="coerce").dropna()
+                                        start_mb = float(_pos.min()) / 1e6
+                                        end_mb = float(_pos.max()) / 1e6
+                                    _explicit = True
+                                    _span_mb = end_mb - start_mb
+                                    logger.info(
+                                        f"[LAI] Region plot: using the "
+                                        f"requested --lai-region chr{first_chr}:"
+                                        f"{start_mb:g}-{end_mb:g}Mb "
+                                        f"({_span_mb:g}Mb span).")
+                                    if _span_mb > 20:
+                                        logger.info(
+                                            f"[LAI] That is a wide region "
+                                            f"({_span_mb:g}Mb). The plot is "
+                                            f"per-sample-per-SNP, so it will be "
+                                            f"slower and individual tracts will "
+                                            f"be hard to resolve; narrow it to a "
+                                            f"few Mb (e.g. "
+                                            f"--lai-region {first_chr}:"
+                                            f"{start_mb:g}-{start_mb+5:g}) for a "
+                                            f"readable view of a specific locus.")
+                                except Exception as _pe:
+                                    logger.warning(
+                                        f"[LAI] Could not parse --lai-region "
+                                        f"{_user_region!r} ({_pe}); expected "
+                                        f"CHR:START-END in Mb, e.g. '8:20-30'. "
+                                        f"Falling back to the default "
+                                        f"illustrative slice.")
+                                    # Restore the pre-parse defaults so the
+                                    # fallback plots a region that actually
+                                    # exists.
+                                    first_chr, start_mb, end_mb = (
+                                        _def_chr, _def_start, _def_end)
+                                    _explicit = False
+                            if not _explicit:
+                                if end_mb - start_mb > _region_cap_mb:
+                                    end_mb = start_mb + _region_cap_mb
+                                # Say plainly that this region is arbitrary.
+                                # It is the first 5Mb of whichever chromosome
+                                # happens to appear first in the .bim -- picked
+                                # by FILE ORDER, not by any scientific
+                                # criterion -- so it is very unlikely to be a
+                                # locus of interest. Previously this was
+                                # written silently, which invited reading it as
+                                # a meaningful result.
+                                logger.info(
+                                    f"[LAI] Region plot: no --lai-region given, "
+                                    f"so plotting an ARBITRARY illustrative "
+                                    f"slice (chr{first_chr}:{start_mb:g}-"
+                                    f"{end_mb:g}Mb -- the first {_region_cap_mb:g}Mb "
+                                    f"of the first chromosome in the .bim, chosen "
+                                    f"by file order). This is a format "
+                                    f"demonstration, NOT a region of interest. "
+                                    f"Pass --lai-region CHR:START-END to plot a "
+                                    f"locus you care about, or --lai-region none "
+                                    f"to skip it.")
                             pheno_arr = (np.asarray(self.phenotypes, dtype=float) - 1
                                          if hasattr(self, 'phenotypes') else None)
                             lai.plot_lai_region(
@@ -3814,9 +4358,49 @@ class JasMAP(Joint_Association):
                             snp_idx=getattr(self, 'chr_snp_idx', None))
 
                 from jasmap.prs.consensus_prs import select_top_snps_streaming
+
+                # Bug fix (feature-selection leakage): this used to pass the
+                # FULL y, so the top-`max_snps` SNPs were chosen by their
+                # correlation with the phenotype across EVERY sample --
+                # including the ones run_prs() later holds out as its test
+                # split. Selecting features using the held-out labels is
+                # textbook leakage: the "held-out" AUC then measures a
+                # selection that already saw those labels, and is not a
+                # generalisation estimate at all.
+                #
+                # This is not a marginal effect. Demonstrated on data with NO
+                # signal whatsoever (random genotypes, random phenotype at the
+                # same 87.6% case rate as the real cohort): the leaky filter
+                # produced a held-out AUC of 1.0000, while filtering on train
+                # samples only gave 0.4489 against a truth of 0.5. It exactly
+                # reproduced a real run reporting AUC=1.000 held-out for a
+                # complex infectious disease at n=733.
+                #
+                # The split is computed HERE, with the same rng seed and the
+                # same construction run_prs() uses, and passed down via
+                # holdout_idx so both stages agree on it. Only the training
+                # samples' phenotypes are visible to the screen; held-out
+                # entries are set to NaN, which select_top_snps_streaming()
+                # already excludes via its own ~isnan(y) mask.
+                _rng_split = np.random.default_rng(42)
+                _valid_idx = np.where(~np.isnan(y))[0]
+                _perm = _rng_split.permutation(len(_valid_idx))
+                _split = max(1, min(int(len(_valid_idx) * 0.8), len(_valid_idx)))
+                _shuf = _valid_idx[_perm]
+                _tr_idx, _te_idx = _shuf[:_split], _shuf[_split:]
+
+                y_screen = np.asarray(y, dtype=float).copy()
+                y_screen[_te_idx] = np.nan
+                logger.info(
+                    f"[PRS] SNP pre-filter will see ONLY the {len(_tr_idx)} "
+                    f"training sample(s); the {len(_te_idx)} held-out sample(s) "
+                    f"are masked out so feature selection cannot use their "
+                    f"phenotypes (avoids leakage into the held-out estimate).")
+
                 keep_idx, G = select_top_snps_streaming(
-                    self.args.bfile, y, X0=X0_for_screen, max_snps=max_snps,
+                    self.args.bfile, y_screen, X0=X0_for_screen, max_snps=max_snps,
                     snp_idx=getattr(self, 'chr_snp_idx', None), verbose=True)
+                self._prs_holdout_idx = _te_idx
                 bim_full = pd.read_csv(self.args.bfile + ".bim", sep=r"\s+", header=None,
                                        names=["CHR","snp","CM","pos","A1","A2"])
                 bim = bim_full.iloc[keep_idx].reset_index(drop=True)
@@ -3945,7 +4529,22 @@ class JasMAP(Joint_Association):
         # samples are still the same study population, just missing
         # outcome data, and reporting a score for them remains meaningful.
         _restrict_idx = None
-        if self.args.mode in ("admix", "gift_admix"):
+        # Refinement: the gate above used MODE as a proxy for "do we know some
+        # samples aren't study subjects". But --pop-file + --admix-label state
+        # that DIRECTLY, in any mode. Found on a real --mode rvat run that
+        # passed both: PRS reported over all 1,363 samples, including 630
+        # explicitly labelled as reference panels (KHS/CEU/YRI/CHB/GIH). Those
+        # are not "the study population missing outcome data" -- they are
+        # different populations included only to anchor ancestry inference, so
+        # reporting risk scores for them is exactly the situation the
+        # admix/gift_admix restriction exists to prevent.
+        #
+        # So: restrict whenever a pop-file explicitly marks samples as
+        # non-study, regardless of mode. Without a pop-file the original
+        # reasoning still holds (unphenotyped samples may genuinely be the
+        # same population, just missing outcomes), so that path is unchanged.
+        _has_pop_labels = bool(getattr(self.args, "pop_file", None))
+        if self.args.mode in ("admix", "gift_admix") or _has_pop_labels:
             _study_mask = self._get_study_cohort_mask(y, genotype_sample_ids=fam["IID"].values)
             _restrict_idx = np.where(_study_mask)[0]
             if len(_restrict_idx) == len(y):
@@ -3958,6 +4557,55 @@ class JasMAP(Joint_Association):
                     f"ancestral population samples used only for local "
                     f"ancestry inference).")
 
+        # Restrict EVERY PRS input to the study cohort before run_prs() sees
+        # it, rather than only restricting what gets reported at the end.
+        #
+        # Reporting-only restriction left non-study samples inside the
+        # computation. The clearest consequence was imputation: per-SNP mean
+        # dosage was computed across all samples, so the 630 reference-panel
+        # individuals -- selected precisely BECAUSE their allele frequencies
+        # differ from the admixed cohort -- set the values used to fill in
+        # admixed samples' missing genotypes. Confirmed from a real run's own
+        # numbers: 168,205 imputed calls at 0.62% of entries implies
+        # 20,000 SNPs x 1,363 samples, i.e. the full cohort, not the 733
+        # phenotyped ones. This is the same contamination already fixed for
+        # RVAT (restrict, then impute) and for self.genotypes (impute each
+        # group separately); PRS was the remaining path.
+        #
+        # Reference samples also have no phenotype, so they can never
+        # contribute to fitting or validation -- they were only ever adding
+        # their allele frequencies to shared statistics. Subsetting here
+        # removes them from imputation, standardisation and every downstream
+        # step at once.
+        _keep = _restrict_idx
+        if _keep is None:
+            _yv = np.asarray(y, dtype=float)
+            _keep = np.where(~np.isnan(_yv))[0]
+            if len(_keep) == len(_yv):
+                _keep = None
+        if _keep is not None and len(_keep) < len(y):
+            _pos = {int(g): i for i, g in enumerate(_keep)}
+            _ho = getattr(self, "_prs_holdout_idx", None)
+            # Re-express the held-out split in the restricted index space so
+            # it still points at the same individuals.
+            _ho_local = (np.array([_pos[int(i)] for i in _ho if int(i) in _pos],
+                                  dtype=int)
+                         if _ho is not None and len(_ho) else None)
+            logger.info(
+                f"[PRS] Restricting ALL PRS inputs to the {len(_keep)} "
+                f"phenotyped study sample(s) of {len(y)} before fitting, so "
+                f"reference-panel genotypes cannot influence imputation, "
+                f"standardisation or any downstream statistic.")
+            G = G[_keep, :]
+            y = np.asarray(y)[_keep]
+            fam = fam.iloc[_keep].reset_index(drop=True)
+            if X0_for_prs is not None:
+                X0_for_prs = np.asarray(X0_for_prs)[_keep, :]
+            if anc_labels is not None:
+                anc_labels = [anc_labels[int(i)] for i in _keep]
+            _restrict_idx = None          # already restricted; nothing left to do
+            self._prs_holdout_idx = _ho_local
+
         prs_scores, validation = run_prs(
             G=G, y=y, bim=bim, fam=fam,
             out_prefix=self.outfolder + "prs_results",
@@ -3968,13 +4616,27 @@ class JasMAP(Joint_Association):
             max_snps=(self.args.prs_max_snps if self.args.prs_max_snps > 0 else None),
             restrict_output_idx=_restrict_idx,
             plots=self.args.plots,
+            # Pass the split used to mask the SNP pre-filter, so run_prs()
+            # evaluates on exactly the samples that were hidden from feature
+            # selection (see the leakage fix at the pre-filter call site).
+            holdout_idx=getattr(self, "_prs_holdout_idx", None),
             seed=42)
 
         self._prs_scores     = prs_scores
         self._prs_validation = validation
 
-        logger.info(f"[PRS] AUC={validation.get('auc',float('nan')):.3f}  "
-                    f"r={validation.get('pearson_r',float('nan')):.3f}")
+        # Report BOTH figures on the summary line. The unqualified "AUC=" that
+        # used to appear here was in-sample and therefore optimistic (see
+        # run_prs()'s held-out block) -- labelling it, and putting the
+        # generalisation estimate beside it, stops the optimistic number from
+        # being read as performance.
+        _ho = validation.get('auc_holdout', float('nan'))
+        _msg = (f"[PRS] AUC={validation.get('auc',float('nan')):.3f} (in-sample)  "
+                f"r={validation.get('pearson_r',float('nan')):.3f} (in-sample)")
+        if _ho == _ho:   # not NaN
+            _msg += (f"  |  AUC={_ho:.3f} (held-out, "
+                    f"n={validation.get('n_holdout',0)}) <- use this one")
+        logger.info(_msg)
 
         # Post-processing: add an "Ancestry" column to the per-SNP weights
         # file for --mode admix/gift_admix, where local ancestry data

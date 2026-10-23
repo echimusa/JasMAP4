@@ -8,8 +8,11 @@ require it at import time.
 """
 
 import os
+import logging
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Style helpers
@@ -138,8 +141,47 @@ def manhattan(df, pval_col="P", chrom_col="CHR", bp_col="BP",
         sub = df[df["_chrom_norm"] == c]
         offsets[c] = running
         running += int(sub[bp_col].max()) + int(5e6)
-    df["x"] = df.apply(
-        lambda r: r[bp_col] + offsets.get(_norm_chrom(r[chrom_col]), 0), axis=1)
+    # Performance fix: this used to be
+    #     df.apply(lambda r: r[bp_col] + offsets.get(...), axis=1)
+    # which invokes a Python lambda once PER ROW -- a million calls for a
+    # genome-wide panel, to do arithmetic numpy can vectorise entirely.
+    # ._chrom_norm is already computed above, so the offset lookup is a
+    # single .map() and the addition is one vector op.
+    df["x"] = df[bp_col].to_numpy() + df["_chrom_norm"].map(offsets).fillna(0).to_numpy()
+
+    # Plotting fix: a genome-wide panel puts ~1M points on a 14x5in canvas,
+    # where the overwhelming majority are non-significant noise piled into a
+    # band at low -log10(p). Those points are individually invisible (they
+    # overplot each other many times over at this density) but still cost
+    # render time and file size, and matplotlib slows markedly past a few
+    # hundred thousand markers.
+    #
+    # Downsampling is applied ONLY to that non-significant cloud, and only
+    # above a point-count threshold. Every point at or above the suggestive
+    # line is always kept, so no real or borderline signal can be dropped by
+    # this -- the visible top of the plot is exactly what it would have been
+    # without downsampling. Below the line, a deterministic random subsample
+    # reproduces the same visual band at a fraction of the cost.
+    MAX_POINTS = 250_000
+    if len(df) > MAX_POINTS:
+        keep_thresh = -np.log10(sugg_line) if sugg_line else 3.0
+        sig_mask = df["log10p"].to_numpy() >= keep_thresh
+        n_sig = int(sig_mask.sum())
+        budget = max(MAX_POINTS - n_sig, 1000)
+        noise_idx = np.flatnonzero(~sig_mask)
+        if len(noise_idx) > budget:
+            rs = np.random.default_rng(0)
+            keep_noise = rs.choice(noise_idx, budget, replace=False)
+            keep = np.zeros(len(df), dtype=bool)
+            keep[np.flatnonzero(sig_mask)] = True
+            keep[keep_noise] = True
+            logger.info(
+                f"[PLOT] Manhattan: {len(df):,} points exceeds the "
+                f"{MAX_POINTS:,} render budget. Keeping ALL {n_sig:,} point(s) "
+                f"at -log10(p) >= {keep_thresh:.2f} and a random "
+                f"{budget:,}-point sample of the non-significant cloud below "
+                f"it. No significant or suggestive point is affected.")
+            df = df[keep]
 
     fig, ax = plt.subplots(figsize=(14,5), dpi=300)
     colors = ["#4393C3","#2166AC"]

@@ -732,6 +732,28 @@ def run_rvat(G, y, bim, fam, out_prefix,
                 f"1st percentile={q01:.4f}, 5th percentile={q05:.4f}. "
                 f"To capture roughly the rarest 5% of variants here you "
                 f"would need --maf-max {q05:.3f} or higher.")
+            # Detect a HARD MAF FLOOR. If the minimum, 1st and 5th percentiles
+            # are all the same value, the panel is not merely short of rare
+            # variants -- it was pre-filtered to remove them, so no --maf-max
+            # setting can recover any. Found on real data where min = 1st pct
+            # = 5th pct = exactly 0.1000, i.e. the panel had been MAF-filtered
+            # at 0.10 upstream. Worth saying explicitly, because the advice
+            # above ("use --maf-max 0.100 or higher") would otherwise invite a
+            # pointless re-run: at that threshold every variant qualifies as
+            # "rare", which makes the gene-based test meaningless rather than
+            # informative.
+            if np.isclose(mmin, q01) and np.isclose(mmin, q05):
+                logger.warning(
+                    f"[RVAT] The minimum, 1st and 5th percentile MAF are all "
+                    f"identical ({mmin:.4f}) -- that is a HARD FLOOR, not a "
+                    f"distribution. This panel was almost certainly MAF-"
+                    f"filtered at {mmin:.2f} before JasMAP saw it, so it "
+                    f"contains NO rare variants at any threshold and "
+                    f"gene-based rare-variant testing is not possible on it. "
+                    f"Raising --maf-max would only reclassify common variants "
+                    f"as 'rare', which is worse than not running the test. "
+                    f"Rare-variant analysis needs WES/WGS data, or an "
+                    f"unfiltered array panel.")
             logger.warning(
                 "[RVAT] Note: if this is genotyping-ARRAY data (rather than "
                 "WES/WGS sequencing), this is expected rather than a "
