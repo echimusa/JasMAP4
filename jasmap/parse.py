@@ -22,6 +22,7 @@ Public functions used by JasMAP2.py (imported as `ps`):
 '''
 
 from __future__ import division
+import logging
 import gc
 import gzip
 
@@ -155,21 +156,96 @@ def read_pheno_file(pheno_file):
     if not lines:
         return np.array([], dtype=float), []
 
-    MISSING_CODES = {-9}  # standard PLINK missing-phenotype sentinel
+    # Values are parsed as FLOAT, so quantitative traits are supported. An
+    # earlier version called int() on every value, which made any
+    # non-integer phenotype (e.g. 1.73, -0.42) raise a ValueError.
+    MISSING_TOKENS = {"-9", "-9.0", "na", "nan", ".", ""}
 
-    def _to_float_or_nan(v):
-        iv = int(v)
-        return np.nan if iv in MISSING_CODES else float(iv)
+    def _to_float_or_nan(v, where):
+        t = str(v).strip()
+        if t.lower() in MISSING_TOKENS:
+            return np.nan
+        try:
+            x = float(t)
+        except ValueError:
+            raise ValueError(
+                f"Phenotype value {t!r} ({where}) is not a number. Use numeric "
+                f"values, with -9 or NA for missing.")
+        return np.nan if x == -9 else x
 
     if len(lines[0].split()) <= 1:
         # Single-column format: no sample IDs available in this file.
-        phenotypes = np.array([_to_float_or_nan(l) for l in lines], dtype=float)
-        return phenotypes, []
+        if not _is_number_or_missing(lines[0]):
+            lines = lines[1:]                     # header row
+        phenotypes = np.array([_to_float_or_nan(l, f"line {i+1}")
+                               for i, l in enumerate(lines)], dtype=float)
+        return clean_phenotype(phenotypes), []
 
     fields = [l.split() for l in lines]
-    phenotypes = np.array([_to_float_or_nan(f[-1]) for f in fields], dtype=float)
+    if not _is_number_or_missing(fields[0][-1]):
+        fields = fields[1:]                       # header row, e.g. FID IID PHENO
+    phenotypes = np.array([_to_float_or_nan(f[-1], f"sample {f[1]}")
+                           for f in fields], dtype=float)
     sample_ids = [f[1] for f in fields]
-    return phenotypes, sample_ids
+    return clean_phenotype(phenotypes), sample_ids
+
+
+def _is_number_or_missing(tok):
+    t = str(tok).strip()
+    if t.lower() in {"-9", "-9.0", "na", "nan", ".", ""}:
+        return True
+    try:
+        float(t)
+        return True
+    except ValueError:
+        return False
+
+
+def clean_phenotype(y):
+    """Apply PLINK's missing-value conventions to raw phenotype values.
+
+    -9 is always missing. For case/control data coded 1 = control,
+    2 = case, PLINK also treats 0 as missing; that rule is applied only when
+    the non-missing values are exactly {0, 1, 2} with both 1 and 2 present,
+    so a 0/1-coded binary trait and any quantitative trait keep 0 as a real
+    value.
+    """
+    y = np.array(y, dtype=float)
+    y[y == -9] = np.nan
+    vals = set(np.unique(y[np.isfinite(y)]).tolist())
+    if vals == {0.0, 1.0, 2.0}:
+        n0 = int(np.sum(y == 0))
+        y[y == 0] = np.nan
+        logging.getLogger(__name__).info(
+            f"[pheno] Phenotype is coded 1/2 with {n0} sample(s) at 0; "
+            f"treating 0 as missing (PLINK convention for 1/2 coding).")
+    return y
+
+
+def encode_phenotype(y):
+    """Single source of truth for turning a phenotype into model input.
+
+    Returns (y_model, kind):
+      binary       coded 1/2 (PLINK)  -> 0/1;  coded 0/1 -> unchanged
+      quantitative values unchanged
+      constant     fewer than two distinct values (nothing to test)
+    Missing values stay NaN.
+
+    This replaces an unconditional "- 1" applied in six places, which
+    assumed 1/2 coding: it turned a 0/1-coded binary trait into -1/0
+    (misread downstream as quantitative), and one fallback dropped every
+    value <= 0, silently discarding much of a standardised quantitative
+    trait.
+    """
+    y = clean_phenotype(y)
+    vals = set(np.unique(y[np.isfinite(y)]).tolist())
+    if len(vals) < 2:
+        return y, "constant"
+    if vals <= {1.0, 2.0}:
+        return y - 1.0, "binary"
+    if vals <= {0.0, 1.0}:
+        return y, "binary"
+    return y, "quantitative"
 
 
 def read_covar_file(covar_file):

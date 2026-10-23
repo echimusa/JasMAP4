@@ -41,6 +41,9 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
+from jasmap.parse import encode_phenotype as _encode_pheno
+
+
 def _align_pheno_to_genotype_samples(phenotypes, pheno_sample_ids, genotype_sample_ids):
     """
     Aligns a --pheno file's (phenotypes, sample_ids) pair against the
@@ -298,7 +301,7 @@ logger.addHandler(console)
 warnings.filterwarnings("ignore")
 
 # ro quiet splash $vt_handoff
-__version__ = "v4.1"
+__version__ = "v4.2"
 __author__ = "Jacquiline Mugo, N. Mulder, Emile .R Chimusa"
 __email__ = "jacquilinemugo@aims.ac.za and emile.chimusa@northumbria.ac.uk"
 __status__ = "Production"
@@ -1148,6 +1151,21 @@ class jasMapInit(jasMapUtils):
                                     f'Number of reference populations must be >= nbanc.\n')
                         self.terminate(self.outfolder + self.logFile)
                         sys.exit(1)
+                    if getattr(self.args, "pop_labels", None):
+                        _want = [x.strip() for x in str(self.args.pop_labels).split(",") if x.strip()]
+                        _have = sorted(set(pf["POP"].astype(str)))
+                        _absent = [w for w in _want if w not in _have]
+                        if _absent:
+                            # Previously only a warning, after which results were
+                            # produced with those ancestry labels unanchored --
+                            # i.e. possibly naming the wrong population.
+                            logger.info(f'Error: --pop-labels entr{"y" if len(_absent)==1 else "ies"} '
+                                        f'{_absent} not found in --pop-file. Populations in '
+                                        f'--pop-file: {_have}. Each --pop-labels entry must '
+                                        f'match a reference population exactly (case-sensitive), '
+                                        f'so its ancestry component can be anchored.\n')
+                            self.terminate(self.outfolder + self.logFile)
+                            sys.exit(1)
                     logger.info(f'[LAI] pop-file validated: {ref_pops} populations, '
                                 f'K={self.args.nbanc}\n')
                     # Store per-sample labels now so PCA plots can use them
@@ -1957,7 +1975,16 @@ class Joint_Association(jasMapInit, LMM):
         # happens to be at whichever scale it's at.
         chr_idx = getattr(self, 'chr_snp_idx', None)
         if chr_idx is not None:
-            if max(chr_idx) < len(raw_lines):
+            if len(raw_lines) == len(chr_idx):
+                # Already restricted to this chromosome -- the normal case for
+                # --yes-anc --chr N, whose LAI runs on chromosome N only.
+                # Previously this fell through to the bounds check below,
+                # which indexes into the FULL panel: chromosome 1 passed by
+                # coincidence (its indices start at 0), every later
+                # chromosome logged a spurious "filtering skipped" warning.
+                logger.info(f"[LAI] Local ancestry file already matches --chr "
+                            f"{self.args.chr} ({len(raw_lines)} SNPs); used as is.")
+            elif max(chr_idx) < len(raw_lines):
                 raw_lines = [raw_lines[i] for i in chr_idx]
             else:
                 logger.warning(
@@ -2082,18 +2109,89 @@ class Joint_Association(jasMapInit, LMM):
             logger.info('\nPseudo-heritability for ancestry %s = %s.\n\n' % (str(anc), str(lai_hmax)))
 
     def read_covar_file(self):
-        '''Reading in the covariate file (FID IID PC1 PC2 ...).
+        """Read --covfile (FID IID cov1 cov2 ...) and MATCH ROWS BY IID.
 
-        Performance fix: replaced the pure-Python `fileinput` line-by-line
-        loop with a single vectorized pandas read. Note: preserved exactly
-        the original's behavior of not skipping a header line (its own
-        `fileinput.lineno() > 0` check was always true, since line numbers
-        start at 1) -- if your covariate file has a text header row, remove
-        it before running, same as with the original script.
-        '''
-        if self.args.covfile:
-            df = pd.read_csv(self.covar_file, sep=r"\s+", header=None, engine="python")
-            self.covar_list = df.iloc[:, 2:].to_numpy(dtype=float)
+        An earlier version took columns 3+ in file order and ignored the IDs,
+        so a covariate file sorted differently from the .fam silently gave
+        each sample someone else's covariates. Rows are now matched to the
+        genotype samples by IID, so file order no longer matters. A header row
+        is detected and skipped. A tested sample (non-missing phenotype) with
+        no covariate row, or a non-numeric covariate, is a hard error;
+        untested samples (e.g. reference panels) without a row get zeros,
+        which never enter the analysis.
+        """
+        if not self.args.covfile:
+            return
+        raw = pd.read_csv(self.covar_file, sep=r"\s+", header=None,
+                          engine="python", dtype=str)
+
+        def _num(t):
+            try:
+                float(t); return True
+            except (TypeError, ValueError):
+                return str(t).strip().lower() in ("na", "nan")
+        if raw.shape[1] < 3:
+            logger.info("Error: --covfile needs at least 3 columns: FID IID cov1 [cov2 ...].\n")
+            self.terminate(self.outfolder + self.logFile); sys.exit(1)
+        if not all(_num(t) for t in raw.iloc[0, 2:]):
+            raw = raw.iloc[1:].reset_index(drop=True)
+            logger.info("[covar] Header row detected in --covfile and skipped.")
+        ids = raw.iloc[:, 1].astype(str).tolist()
+        vals = raw.iloc[:, 2:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+
+        geno = getattr(self, "_geno_sample_ids", None)
+        if not geno:
+            logger.warning("[covar] Genotype sample IDs unavailable; covariates "
+                           "are used in FILE ORDER. Make sure --covfile lists "
+                           "samples in exactly the genotype file's order.")
+            self.covar_list = vals
+            logger.info("\nReading PCA file done.\n")
+            return
+
+        dups = sorted({i for i in ids if ids.count(i) > 1})
+        if dups:
+            logger.info(f"Error: --covfile lists {len(dups)} IID(s) more than once, "
+                        f"e.g. {dups[:5]}. Each sample must appear once.\n")
+            self.terminate(self.outfolder + self.logFile); sys.exit(1)
+        pos = {iid: k for k, iid in enumerate(ids)}
+        if not any(g in pos for g in geno):
+            logger.info("Error: no IID in --covfile matches the genotype samples. "
+                        "Expected columns: FID IID cov1 [cov2 ...], with IIDs as in "
+                        f"the genotype file (e.g. {geno[:3]}); got e.g. {ids[:3]}.\n")
+            self.terminate(self.outfolder + self.logFile); sys.exit(1)
+
+        out = np.zeros((len(geno), vals.shape[1]))
+        ph = getattr(self, "phenotypes", None)
+        tested = (np.isfinite(np.asarray(ph, dtype=float))
+                  if ph is not None and len(ph) == len(geno)
+                  else np.ones(len(geno), dtype=bool))
+        miss_t, bad_t, n_fill = [], [], 0
+        for j, g in enumerate(geno):
+            if g in pos:
+                row = vals[pos[g]]
+                if tested[j] and not np.all(np.isfinite(row)):
+                    bad_t.append(g)
+                out[j] = np.nan_to_num(row)
+            elif tested[j]:
+                miss_t.append(g)
+            else:
+                n_fill += 1
+        if miss_t:
+            logger.info(f"Error: {len(miss_t)} tested sample(s) have no row in "
+                        f"--covfile, e.g. {miss_t[:10]}. Every sample with a "
+                        f"phenotype needs covariates.\n")
+            self.terminate(self.outfolder + self.logFile); sys.exit(1)
+        if bad_t:
+            logger.info(f"Error: {len(bad_t)} tested sample(s) have missing or "
+                        f"non-numeric covariate values, e.g. {bad_t[:10]}.\n")
+            self.terminate(self.outfolder + self.logFile); sys.exit(1)
+        if [i for i in ids if i in set(geno)] != [g for g in geno if g in pos]:
+            logger.info("[covar] --covfile rows are in a different order from the "
+                        "genotype samples; matched by IID.")
+        if n_fill:
+            logger.info(f"[covar] {n_fill} untested sample(s) (no phenotype) have no "
+                        f"covariate row; set to 0 -- they are not analysed.")
+        self.covar_list = out
         logger.info("\nReading PCA file done.\n")
 
     # Bug fix (#7 cleanup): read_geno_snp() and read_geno_ind() are no longer
@@ -2299,6 +2397,7 @@ class Joint_Association(jasMapInit, LMM):
         self.phenotypes, self.samples_list = ps.read_pheno_file(self.args.pheno)
         self.phenotypes = _align_pheno_to_genotype_samples(
             self.phenotypes, self.samples_list, ind_ids)
+        self._geno_sample_ids = [str(x) for x in ind_ids]
 
         kS_time = time.time()
         # Bug fix (#8): ps.makeG() returns [kinship_matrix, geno_id_series] --
@@ -2425,6 +2524,7 @@ class Joint_Association(jasMapInit, LMM):
         self.phenotypes, self.samples_list = ps.read_pheno_file(self.args.pheno)
         self.phenotypes = _align_pheno_to_genotype_samples(
             self.phenotypes, self.samples_list, list(bed.iid))
+        self._geno_sample_ids = [str(x) for x in bed.iid]
 
         kS_time = time.time()
         if self._use_streaming_lmm:
@@ -2498,6 +2598,7 @@ class Joint_Association(jasMapInit, LMM):
                 f"({100*len(self.chr_snp_idx)/_vcf_n_variants:.2f}% of the panel).\n")
         self.phenotypes = _align_pheno_to_genotype_samples(
             self.phenotypes, self.samples_list, vcf_actual_samples)
+        self._geno_sample_ids = [str(x) for x in vcf_actual_samples]
         logger.info("\nReading vcf file took %s time to finish.\n\n"
                     % str(round(time.time() - starting_time, 4)) + 's')
 
@@ -4024,8 +4125,13 @@ class JasMAP(Joint_Association):
                                     f"Pass --lai-region CHR:START-END to plot a "
                                     f"locus you care about, or --lai-region none "
                                     f"to skip it.")
-                            pheno_arr = (np.asarray(self.phenotypes, dtype=float) - 1
-                                         if hasattr(self, 'phenotypes') else None)
+                            pheno_arr = None
+                            if hasattr(self, 'phenotypes'):
+                                _pe, _pk = _encode_pheno(self.phenotypes)
+                                # Case/control stratification only applies
+                                # to a binary trait; a quantitative one is
+                                # plotted unstratified.
+                                pheno_arr = _pe if _pk == "binary" else None
                             lai.plot_lai_region(
                                 chrom    = first_chr,
                                 start_mb = start_mb,
@@ -4074,7 +4180,7 @@ class JasMAP(Joint_Association):
         from jasmap.prs.consensus_prs import impute_missing_genotypes
         G = impute_missing_genotypes(G, tag="GIFT")
 
-        y = self.phenotypes.astype(np.float64) - 1  # convert 1/2 -> 0/1
+        y = _encode_pheno(self.phenotypes)[0]  # 1/2 -> 0/1 if binary; quantitative unchanged
 
         out_gift = self.outfolder + self.args.mode + "_results"
 
@@ -4216,7 +4322,7 @@ class JasMAP(Joint_Association):
         # need G pre-imputed either -- compute_auto_pca_dense() delegates
         # to randomized_kinship_eigendecomp(), which already has its own
         # NaN handling internally (confirmed directly).
-        y = np.asarray(self.phenotypes, dtype=np.float64) - 1
+        y = _encode_pheno(self.phenotypes)[0]
 
         # Population stratification covariates for RVAT null-model fitting.
         # Same priority as run_joint_analysis()/PRS: --covfile if given,
@@ -4304,7 +4410,7 @@ class JasMAP(Joint_Association):
 
         from jasmap.prs.consensus_prs import run_prs
 
-        y = self.phenotypes.astype(np.float64) - 1
+        y = _encode_pheno(self.phenotypes)[0]
 
         # Decide whether streaming can be used for the genotype load itself.
         # C+T scores SNPs matching EXTERNAL summary statistics (--sumstats),
@@ -4631,11 +4737,23 @@ class JasMAP(Joint_Association):
         # generalisation estimate beside it, stops the optimistic number from
         # being read as performance.
         _ho = validation.get('auc_holdout', float('nan'))
-        _msg = (f"[PRS] AUC={validation.get('auc',float('nan')):.3f} (in-sample)  "
-                f"r={validation.get('pearson_r',float('nan')):.3f} (in-sample)")
-        if _ho == _ho:   # not NaN
-            _msg += (f"  |  AUC={_ho:.3f} (held-out, "
-                    f"n={validation.get('n_holdout',0)}) <- use this one")
+        _kind = _encode_pheno(self.phenotypes)[1]
+        if _kind == "quantitative":
+            # AUC needs two classes; for a quantitative trait it rests on an
+            # arbitrary split, so lead with the held-out correlation instead.
+            _rho = validation.get('pearson_r_holdout', float('nan'))
+            _msg = (f"[PRS] Quantitative trait: r={validation.get('pearson_r',float('nan')):.3f} "
+                    f"(in-sample)")
+            if _rho == _rho:
+                _msg += (f"  |  r={_rho:.3f}, R^2={_rho**2:.3f} (held-out, "
+                         f"n={validation.get('n_holdout',0)}) <- use this one. "
+                         f"(AUC is not meaningful for a quantitative trait.)")
+        else:
+            _msg = (f"[PRS] AUC={validation.get('auc',float('nan')):.3f} (in-sample)  "
+                    f"r={validation.get('pearson_r',float('nan')):.3f} (in-sample)")
+            if _ho == _ho:   # not NaN
+                _msg += (f"  |  AUC={_ho:.3f} (held-out, "
+                        f"n={validation.get('n_holdout',0)}) <- use this one")
         logger.info(_msg)
 
         # Post-processing: add an "Ancestry" column to the per-SNP weights
@@ -4802,10 +4920,11 @@ class JasMAP(Joint_Association):
         # y = phenotype (0/1 for case-control, continuous otherwise)
         y = None
         if hasattr(self, 'phenotypes') and self.phenotypes is not None:
-            y = np.asarray(self.phenotypes, dtype=np.float64) - 1
+            y = _encode_pheno(self.phenotypes)[0]
         elif fam is not None and "PHENO" in fam.columns:
-            y = fam["PHENO"].values.astype(float)
-            y = np.where(y > 0, y - 1, np.nan)
+            # Was np.where(y > 0, y - 1, nan): that discarded every value
+            # <= 0, i.e. much of any standardised quantitative trait.
+            y = _encode_pheno(fam["PHENO"].values.astype(float))[0]
 
         cons_out = self.outfolder + "consensus_gwas"
         engine = ConsensusGWAS(

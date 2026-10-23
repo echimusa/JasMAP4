@@ -1,5 +1,41 @@
 # Changelog
 
+## v4.2
+
+### Fixes
+
+- **Quantitative phenotypes now work in every mode.** The phenotype reader
+  called `int()` on each value, so any non-integer trait (e.g. `1.73`) failed.
+  Values are now read as numbers; `-9` and `NA` mean missing. Six places also
+  applied an unconditional "subtract 1", assuming 1/2 coding: a 0/1-coded
+  binary trait became -1/0 (and was then treated as quantitative), and one
+  fallback discarded every value <= 0. A single encoder now handles all
+  cases: PLINK 1/2 -> 0/1, 0/1 kept, quantitative unchanged. Tested through
+  GWAS, admix, gift, gift_admix, rvat, LAI, PRS and consensus with a trait
+  containing negative values and zeros: no tested sample was dropped. For a
+  quantitative trait, PRS now reports held-out r and R^2 rather than AUC.
+  The GLMMs need a binary trait and fall back to the LMM, with a warning.
+- **Covariates are matched by sample ID.** `--covfile` rows were taken in file
+  order, so a file sorted differently from the `.fam` silently gave each
+  sample someone else's covariates. Rows are now matched by IID; a shuffled
+  file gives identical results. A header row is detected and skipped. A
+  tested sample with no covariate row, a non-numeric value, or a duplicated
+  IID is an error.
+- **Unmatched `--pop-labels` is an error.** An entry not present in
+  `--pop-file` (including a case mismatch such as `afr` for `AFR`) now stops
+  the run with a message listing the populations that do exist, instead of
+  warning and producing results with unanchored ancestry labels.
+- **No spurious warning in per-chromosome runs.** With `--yes-anc --chr N`,
+  every chromosome after the first logged "--chr filtering skipped" for the
+  local ancestry file. The file is already restricted to that chromosome;
+  this is now recognised and reported plainly. Results are unchanged.
+
+### Re-run advised
+
+- Analyses that used `--covfile` with a file not in `.fam` order.
+- Binary traits coded 0/1 (rather than PLINK 1/2) run through RVAT, PRS or
+  consensus, which were treated as quantitative.
+
 ## v4.1
 
 Changes since the `v4.0` baseline. Several fix statistical errors, so

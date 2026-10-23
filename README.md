@@ -512,6 +512,34 @@ implemented.
 
 ---
 
+## Input file formats
+
+**Phenotype (`--pheno`).** `FID IID PHENO` (or a single column in sample
+order); an optional header row is skipped. Binary or quantitative:
+
+| Values | Read as |
+|--------|---------|
+| `1` / `2` (PLINK) | binary: control / case |
+| `0` / `1` | binary: control / case |
+| anything else, e.g. `1.73`, `-0.42` | quantitative, used as given |
+| `-9`, `NA` | missing |
+| `0` alongside `1` and `2` | missing (PLINK convention for 1/2 coding) |
+
+The GLMMs (`--am-model glmm`, `--gwas-model glmm`) need a binary trait and
+otherwise fall back to the LMM. For a quantitative trait, PRS reports
+held-out r and R².
+
+**Covariates (`--covfile`).** `FID IID cov1 [cov2 ...]`, optional header.
+Rows are **matched by IID**, so the order need not follow the `.fam`. Every
+sample with a phenotype must have a row with numeric values.
+
+**Populations (`--pop-file`, `--pop-labels`).** Each `--pop-labels` entry must
+match a population in `--pop-file` exactly (case-sensitive), so its ancestry
+component can be anchored; otherwise the run stops with the list of
+populations found.
+
+---
+
 ## Preparing the phenotype file
 
 Reference-panel samples must be coded missing (`-9`), and the study cohort
